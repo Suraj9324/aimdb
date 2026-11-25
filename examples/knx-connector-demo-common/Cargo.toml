@@ -1,0 +1,27 @@
+[package]
+name = "knx-connector-demo-common"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Shared business logic for KNX demos - runs on MCU, edge, and cloud"
+
+[features]
+default = []
+std = ["aimdb-core/std", "serde/std"]
+# Embassy-specific features (no_std)
+defmt = ["dep:defmt"]
+
+[dependencies]
+# Core AimDB - runtime agnostic; `derive` for the `RecordKey` keys
+aimdb-core = { path = "../../aimdb-core", default-features = false, features = [
+    "alloc",
+    "derive",
+] }
+# KNX DPT encoding (no runtime features needed for the codecs)
+aimdb-knx-connector = { path = "../../aimdb-knx-connector", default-features = false }
+# Serialize/Deserialize on the shared types, for remote access
+serde = { workspace = true }
+
+# Optional defmt for embedded logging
+defmt = { workspace = true, optional = true }

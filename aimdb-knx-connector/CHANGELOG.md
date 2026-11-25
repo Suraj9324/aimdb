@@ -1,0 +1,235 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.6.0] - 2026-11-03
+
+### Changed (breaking)
+
+- **Write timestamps (#326).** `client::connection_task` takes the instance
+  clock (`Arc<dyn InstanceClock>`) instead of `Arc<dyn RuntimeOps>`.
+
+- **`KnxConnector::new(binder, delay, url)` no longer takes `&'static
+  Channels`**. The connection task dispatches inbound telegrams
+  into their records and pulls outbound values from their record buffers
+  itself, so no `embassy_sync` queue sits between it and core. `Channels`,
+  `TelegramChannel`, `CommandChannel`, `DEFAULT_QUEUE` and the `N` const
+  generic on `KnxConnector` are removed, as is the `embassy-sync` dependency.
+  Delete the `static CHANNELS` and the argument.
+- **A command produced while the tunnel connects waits in its record buffer**
+  and goes out once the handshake completes; routes are subscribed in
+  `build()`, before the task first runs. Which values survive an outage is the
+  record buffer's decision.
+- **`critical-section-std-impl` is a deprecated no-op**, kept so existing
+  consumers keep building. Nothing here needs a `critical-section`
+  implementation any more.
+
+### Changed
+
+- **The `defmt` feature depends on `defmt` directly (#352)**, and enables
+  `defmt/ip_in_core`: core's `log_*!` macros now forward to `defmt`, and the
+  gateway address (`core::net::SocketAddr`) is formatted there.
+
+## [0.5.0] - 2026-09-18
+
+### Changed
+
+- **One connector for both runtimes (breaking).**
+  `KnxConnector::new(binder, delay, url, &CHANNELS)` is generic over core's
+  `DatagramBinder` and `Delay`: a host passes `TokioNet::udp(..)`/`TokioDelay`
+  where an MCU passes `EmbassyNet::udp(..)`/`EmbassyDelay`. One constructor, no
+  runtime named in this crate's API, and no `aimdb-tokio-adapter` dependency —
+  the adapter stays a dev-dependency, as design 052 §8 calls for.
+  `with_command_queue_size` becomes the const generic `N` — an
+  `embassy_sync::Channel` is sized at compile time. `tokio_client` and
+  `embassy_client` are deleted with the `Tokio*`/`Embassy*` aliases, and
+  `aimdb-codegen` emits the same call with the Tokio transports.
+- **Feature gates split `std` / `no_std + alloc` instead of naming runtimes
+  (breaking), matching the TCP and serial connectors.** The new `connector`
+  gate is the whole connector — tunnel engine, connection task, `KnxConnector`
+  — on `no_std + alloc`; `std = ["connector", "aimdb-core/std",
+  "knx-pico/std"]` only lifts `no_std` and adds knx-pico's std error impls plus
+  the back-compat DPT re-exports. Neither gate names an executor, so a
+  FreeRTOS/lwIP caller enables `connector` and passes its own binder and clock
+  without claiming to be Embassy. `tokio-runtime` and `embassy-runtime` remain
+  as deprecated aliases for `std` and `connector`; remove after a release.
+
+  This drops the dependencies the deleted per-runtime clients had needed:
+  `aimdb-embassy-adapter`, `embassy-net`, `embassy-time`, `static_cell` and
+  `dep:defmt` (plus the long-unused `futures-core`, `thiserror` and
+  `embassy-executor`). The embedded graph goes from 88 crates to 46, and the
+  crate no longer depends on *either* adapter — the asymmetry that survived the
+  constructor change, since only the Tokio side had been cleaned up.
+
+  `embassy-sync` stays, moved onto `connector`: it is no_std, no_alloc, pulls
+  no executor, and its `Channel` is this connector's public queue type
+  (`Channels`) on every runtime. `embassy-futures` stays unconditional.
+- **Selecting a `critical-section` implementation is left to the final binary.**
+  `CriticalSectionRawMutex` needs one to link, but the impl is registered by
+  symbol name and is global to the binary, so a library that enables it hands
+  every downstream binary a duplicate-symbol error with no way to opt out — the
+  crate's own docs reserve the choice for the final binary. The new opt-in
+  `critical-section-std-impl` feature is available for a std binary that wants
+  it from here; this crate's tests get the impl from a dev-dependency.
+- **Reports through the `log_*` facade instead of `tracing::` directly** (design
+  050 §10.5), so a `log` destination — an FFI layer's, say — sees this crate's
+  events too. Each call site also shed the hand-written
+  `#[cfg(feature = "tracing")]` the facade carries itself. The `tracing` feature
+  no longer pulls `dep:tracing`; a mirrored `log` feature is added alongside it.
+  No change to what is emitted, or to a consumer that enables `tracing`.
+
+### Added
+
+- **`client::connection_task` — one connection task for both runtimes.** Generic
+  over core's `DatagramBinder` and `Delay`, it binds, advertises the socket's real
+  local endpoint (HPAI) instead of the NAT-style `0.0.0.0:0` — falling back to NAT
+  on a cycle whose stack exposes no address, so a rebind never re-advertises the
+  previous cycle's port, and on a socket bound to an unspecified IP (see *Fixed*)
+  — drives the shared `TunnelEngine`, and rebinds on socket reset. Its select alternates the inbound and command arms each pass, since
+  `select3` polls in declaration order where the `tokio::select!` it replaces
+  chose among ready arms at random. `shared_channel` bridges it to the
+  `embassy_sync` channels, which now back the task on std too.
+- **Spec-conformant TUNNELING_REQUEST retransmission — `TunnelConfig::ack_retransmits` (036 W4, default `1`).** When a tracked outbound telegram's ACK does not arrive within `ack_timeout_ms`, the engine now retransmits the byte-identical frame (same sequence counter, buffered in the pending-ACK slot per KNXnet/IP 3.8.4) and, when the repeat also goes unanswered, reports `Action::AckTimeout` **and tears the connection down** — so subsequent commands queue for the re-handshake instead of being sent into a dead tunnel. Hardware-bench evidence motivating this: ten button-press writes issued during a link outage's heartbeat-detection window (up to ~65 s) were silently lost with only warnings; with retransmission the loss window shrinks to ~2× `ack_timeout_ms`. `ack_retransmits: 0` restores the previous expire-and-warn behavior (no retransmit, no disconnect, no frame buffering — though the 16-slot frame capacity, ~4.5 KiB, is statically reserved either way on `heapless`). The retransmit delay is `ack_timeout_ms` (default 3 s, the constant both pre-engine implementations used); set it to `1_000` for strict spec timing. Covered by engine unit tests and a fake-gateway test that drops the first ACK and asserts the identical repeat.
+
+### Fixed
+
+- **A `Busy` bind is logged as the caller mistake it is.** The bind-retry loop
+  treated every failure alike, so a binder whose socket is held elsewhere — a
+  clone of a single-socket `EmbassyUdpBinder`, say — produced one identical
+  "KNX bind failed; retrying" line every 5 s with nothing pointing at the
+  cause. `TransportError::Busy` now logs distinctly. Recovery is unchanged: a
+  `Busy` binder can free up if the other holder drops, so both cases still
+  retry.
+- **A second KNX connector now fails the build instead of silently duplicating
+  every route.** `KnxConnector` declares core's new
+  `ConnectorBuilder::owns_scheme`, so registering two is a configuration error.
+  It never worked: `build` collects every `knx://` route regardless of which
+  gateway it was meant for, so each connector claimed all of them — every
+  `link_to` got two publishers, and sharing one `Channels` additionally put two
+  connection tasks on one command queue, splitting writes between gateways at
+  random. This is a guard, not a new limit: one connector is one tunnel to one
+  gateway and carries the whole bus behind it, with as many group addresses as
+  records declare. What it rules out is a second *gateway*, which the
+  scheme-keyed routing cannot express.
+- **An unspecified bind address now advertises the NAT HPAI, not a real port
+  beside `0.0.0.0`.** The CONNECT_REQUEST's HPAI was built from `local_addr()`
+  with no check on the address, so binding `0.0.0.0` — the host default, and
+  what both demos, the crate doc example and `aimdb-codegen` all pass, since a
+  binary rarely knows which interface to pick — put `0.0.0.0:<real port>` on the
+  wire. That is neither an endpoint a gateway can reach nor the NAT form the
+  spec defines, and a gateway honouring the HPAI would send its tunnel data into
+  the void. An unspecified IP now takes the `LocalEndpoint::Nat` branch and
+  emits `0.0.0.0:0` (KNXnet/IP 5.2.3), which tells the gateway to reply to the
+  datagram's source address. A bind to a real interface address is unaffected
+  and still advertised explicitly. Both pre-rewrite clients had this (the tokio
+  one bound `"0.0.0.0:0"` and ran the same logic), so the handshake changes for
+  every default deployment.
+- **Inbound single-octet telegrams no longer decode to `0` (#210).** A telegram carrying exactly one data octet — every DPT5 datapoint (5.001 percentage, 5.003 angle, 5.010 counter, …) — was published as `0` instead of its value. `knx-pico` derived the application data as `[9 .. 7 + npdu_length)`, one octet short of the KNX encoding (the NPDU length octet counts the APCI octet plus the data octets, so the data spans `[9 .. 8 + npdu_length)`); the slice came back empty, the telegram was taken for a 6-bit encoded one, and its value was read out of the APCI octet as `0x80 & 0x3F` — zero. Only single-octet payloads were affected: DPT1 was genuinely 6-bit encoded, and DPT9/DPT14 happened to work because the old code ignored the parsed slice and read to the end of the datagram. Fixed at the root in the fork (`aimdb-dev/knx-pico` `b4883c4`, reported upstream as [cc90202/knx-pico#4](https://github.com/cc90202/knx-pico/issues/4)) — the same off-by-one that made 6-bit telegrams panic, which the previously carried patch had only clamped to an empty slice. `parse_telegram` now reads the parsed frame instead of re-deriving cEMI offsets, so the payload is bounded by the NPDU length octet rather than running to the end of the datagram. **Requires the updated fork** — see the patch note in the [usage guide](../docs/aimdb-usage-guide.md).
+- **Heartbeat-response liveness — a dead send path or expired gateway channel now reconnects (review follow-up to #135).** The engine tracks each CONNECTIONSTATE_REQUEST and drops the connection when the gateway's CONNECTIONSTATE_RESPONSE doesn't arrive within the new `TunnelConfig::heartbeat_response_timeout_ms` (default 10 s, the KNX spec timeout) or reports a non-zero status (e.g. the gateway expired the channel during an outage). This restores the old tokio client's recovery from silently-failing sends — the recv path of an unconnected UDP socket never errors, so without it a route flap left the tunnel `Connected` forever with a stale channel id — and adds genuine liveness detection on both runtimes.
+- **Pending-ACK tracking is accurate under send failures and bursts.** A frame the transport could not hand to the socket is untracked (`TunnelIo::send` reports success; previously the 3 s sweep warned "ACK timeout" for a telegram that never left the host), and a burst deeper than the 16-entry pending map evicts-and-reports the oldest entry instead of silently dropping its timeout reporting.
+- **Tokio: the gateway address is validated in `build()` (issue #133 contract).** A typo'd IP — or a hostname, which `SocketAddr` parsing never resolves — now fails `ConnectorBuilder::build` like on Embassy, instead of producing a healthy-looking connector whose task parked forever logging once per hour.
+- **No tight re-poll of an erroring socket during backoff.** Every socket error tears the erroring socket down (an already-running backoff keeps its deadline), and both shims wait out the engine's backoff deadline before binding the fresh socket — matching the old clients' teardown-sleep-rebind pacing.
+
+### Added
+
+- **Sans-io KNX/IP tunneling engine — one lifecycle implementation for both transports (Issue #135, [design doc §3.7](../docs/design/034-technical-debt-review.md)).** New runtime-neutral `tunnel` module (`no_std + alloc`): a poll-based `TunnelEngine` owning the CONNECT handshake, channel id, wrapping sequence counters, pending-ACK map (with the non-standard 4-byte-ACK fallback parse), keepalive schedule, ACK-timeout sweep, and reconnect backoff — events in (`handle_datagram`/`handle_command`/`handle_socket_error` + `poll(now)`), `Action`s out (`Send`/`Telegram`/`ResetSocket`/`AckTimeout`), `next_deadline()` for timer arming. `tokio_client.rs` and `embassy_client.rs` are reduced to socket shims; the lifecycle is covered by 15 host unit tests plus a fake-gateway localhost-UDP integration roundtrip. Behavior notes: Embassy gains the 5 s CONNECT_RESPONSE timeout; both shims reconnect on fatal *recv* errors, while a failed outbound send is logged and the tunnel kept (transient `ENOBUFS`/route flaps must not force a 5 s re-handshake); a persistently dead send path is caught by the heartbeat-response timeout (see *Fixed*); truncated `TUNNELING_REQUEST`s (no full connection header) are dropped without an ACK instead of being ACKed with a fabricated sequence number, and each datagram is parsed exactly once; the CONNECT_REQUEST HPAI stays per-transport (`LocalEndpoint`: tokio = real bound address, Embassy = NAT); commands queue (not drop) during a reconnect cycle, as before. The action-drain policy is shared (`tunnel::drain_actions` over a per-transport `TunnelIo`), and publish validation is shared (`GroupWrite::try_new` — destination checked before payload size on both runtimes; the tokio client previously reported `MessageTooLarge` first). The tokio connection task survives an inbound-only configuration (no `link_to` routes): a closed command channel only disables its select arm instead of exiting the task that routes inbound telegrams.
+
+### Changed (breaking)
+
+- **Issue #135:** the tokio `KnxCommand` oneshot ack-response channel is deleted (it was dead code — `KnxSink` always sent `None`); the Embassy module's `KnxCommand`/`KnxCommandKind`/`GroupWriteData` types are replaced by the engine's `tunnel::GroupWrite`.
+- **Issue #131:** the Embassy `KnxConnectorBuilder::new` takes the network stack — `KnxConnectorBuilder::new(gateway_url, stack)` — since the deleted `EmbassyNetwork` runtime trait can no longer supply it; both `ConnectorBuilder` impls are non-generic (`build(&self, db: &AimDb)`).
+
+### Changed
+
+- **Embassy connection loop: the connected/disconnected select fork is collapsed into one `select3` ([follow-up doc §2.1](../docs/design/035-review-followups-deferred.md)).** The command arm is conditional (`pending()` while connecting / backing off) instead of the whole select shape, so the datagram Ok/Err handling exists once and the two branches can no longer drift. Queue-while-disconnected semantics are unchanged: commands keep buffering in the static channel and flush after the handshake. Since both shims gate command intake on connectivity, the engine's disconnected drop path is unreachable in production — the shims' "Not connected, dropping GroupWrite" warnings are removed and `TunnelEngine::handle_command`'s `false` return is documented as a defensive contract (engine unit tests cover it). No API change.
+- **Connector-build errors carry their message on `no_std` too (Issue #129).** With `DbError` unified on `alloc::String`, the dual `#[cfg]` error-construction branches in both clients collapse to one `DbError::runtime_error(...)` expression; the Embassy client's "Failed to build KNX connector" detail is no longer dropped on embedded targets. No API change.
+- **Tokio client rebuilt on the shared data-plane toolkit (Issue #39, [design doc](../docs/design/remote-access-via-connectors.md)).** The hand-rolled consume-serialize-publish and telegram read-route loops are replaced by `aimdb-core`'s `pump_sink` / `pump_source` helpers: the connector now writes only a `KnxSink` (`Connector`, parses the destination group address and forwards a fire-and-forget `GroupValueWrite`) and a `KnxSource` (`Source`, yields each inbound `(group_address, payload)`) and composes the pumps in `build()`. The routing `Router` is (re)built inside `pump_source`. `std` enables `aimdb-core/connector-session` (where the pump helpers live; `std` implies it transitively). No public API change.
+- **Outbound publishers survive a consumer lag (Tokio + Embassy).** A `BufferLagged` (SPMC-ring overflow) on the outbound reader now skips the gap and keeps publishing instead of terminating the publisher; only a closed buffer stops it.
+- **M17 — Embassy client rebuilt on core's pumps via the adapter spine ([Design 033](../docs/design/033-M17-unify-connectors-drop-send.md)).** The hand-rolled outbound publisher loops are gone; this crate now contributes only the KNX/IP **protocol** (UDP socket + tunnelling state machine), force-`Send`ed once via `aimdb_embassy_adapter::connectors::into_box_future` — **no `unsafe`, no `SendFutureWrapper`** remain in this crate. Data-flow changes:
+  - **Outbound** rides core's `pump_sink` through the existing `Connector` impl (commands onto the `CriticalSectionRawMutex` command channel, which is already `Send` — no force-`Send` bridge needed). Behavior change: when a topic provider returns an **invalid dynamic group address**, the value is now dropped (`PublishError::InvalidDestination`, logged by the pump) instead of falling back to the URL's default address — silently writing to a different group address than the provider asked for was misrouting, and this matches the Tokio half.
+  - **Inbound** rides core's `pump_source` via a new static 32-deep telegram channel (`KnxSource` drains it). The protocol loop forwards each parsed telegram with `try_send` — **drop + log when the channel is full** rather than awaiting, so a slow consumer can never stall the loop that answers `TUNNELING_ACK`s and heartbeats (a stalled loop would time out the gateway connection, losing far more than the dropped telegram).
+
+### Changed (breaking)
+
+- **`ConnectorBuilder::build()` now returns `Vec<BoxFuture<'static, ()>>` instead of `Arc<dyn Connector>` (Issue #88).** Both Tokio and Embassy implementations updated.
+- `spawn_connection_task()` → `build_connection_future()`; the `mpsc::channel` for outbound commands is created up front, the receiver captured by the connection future, and the sender cloned into each outbound publisher future. `spawn_outbound_publishers()` → `collect_outbound_futures()`.
+- `R: Spawn` bounds dropped in favour of `R: RuntimeAdapter`.
+- The `transport::Connector` impl on `KnxConnectorImpl` was removed alongside the discarded `Arc<dyn Connector>` return path (Issue #88) — then reinstated as the pure outbound I/O adapter that `pump_sink` drives (Issue #39 / M17): it is no longer a programmatic-publish surface but the route through which every outbound record reaches the command channel.
+
+## [0.4.0] - 2026-05-22
+
+### Changed
+
+- Updated `Router::route()` calls to pass runtime context via `db.runtime_any()` in both Tokio and Embassy clients, enabling context-aware deserializers (Design 026)
+- Updated outbound publishers (Tokio and Embassy) to dispatch via `SerializerKind`, enabling context-aware serializers with `db.runtime_any()`
+
+## [0.3.1] - 2026-03-16
+
+### Changed
+
+- Updated Embassy dependency versions: executor 0.10.0, time 0.5.1, sync 0.8.0, futures 0.1.2, net 0.9.0
+
+## [0.3.0] - 2026-02-21
+
+### Added
+
+- **Dynamic Group Address Routing (Design 018)**: Full support for dynamic KNX group address resolution
+  - **Outbound**: Uses `TopicProvider` to dynamically determine group addresses based on data values. Configure via `.with_topic_provider()` on outbound connectors.
+  - **Inbound**: Uses `TopicResolverFn` for late-binding subscription addresses at connector startup. Configure via `.with_topic_resolver()` on inbound connectors.
+  - Addresses resolved at connector startup via `collect_inbound_routes()` and per-telegram via `TopicProviderFn` for outbound
+
+## [0.2.0] - 2025-12-15
+
+### Changed
+
+- **Breaking: Record Registration**: Updated demo examples to use new key-based `configure<T>(key, |reg| ...)` API
+- All demo records now have explicit keys (e.g., `"lights.state"`, `"temp.livingroom"`, `"lights.control"`)
+- Demos refactored to use shared `knx-connector-demo-common` crate for cross-platform types, keys, and monitors
+
+## [0.1.0] - 2025-11-20
+
+### Added
+- Initial implementation of KNX/IP connector
+- Dual runtime support (Tokio and Embassy)
+- KNXnet/IP Tunneling protocol support
+- Inbound monitoring (KNX bus → AimDB records)
+- Outbound control (AimDB records → KNX bus)
+- Group address parsing (3-level format)
+- DPT type support via knx-pico integration
+- Automatic reconnection on connection loss (5s interval)
+- **ACK timeout handling** with 3-second timeout for outbound telegrams
+- **Heartbeat/keepalive** (CONNECTIONSTATE_REQUEST every 55s)
+- **Comprehensive unit tests** (group addresses, frames, connection state)
+- **Production deployment guide** in README.md
+- `tokio-knx-connector-demo` example with bidirectional control
+- `embassy-knx-connector-demo` example for embedded systems
+
+### Fixed
+- Proper sequence number tracking for ACK validation
+- TUNNELING_ACK detection and processing
+- Pending ACK cleanup on timeout
+
+### Known Limitations
+- No KNX Secure support (plaintext only)
+- No group address discovery
+- Fire-and-forget publishing (no bus-level confirmation)
+- Single connection per gateway instance
+- No routing mode support
+
+## [0.1.0] - 2025-11-20
+
+Initial beta release for production evaluation.
+
+[Unreleased]: https://github.com/aimdb-dev/aimdb/compare/v3.0.0...HEAD
+[0.6.0]: https://github.com/aimdb-dev/aimdb/compare/v2.0.0...v3.0.0
+[0.5.0]: https://github.com/aimdb-dev/aimdb/compare/v1.1.0...v2.0.0
+[0.4.0]: https://github.com/aimdb-dev/aimdb/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/aimdb-dev/aimdb/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/aimdb-dev/aimdb/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/aimdb-dev/aimdb/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/aimdb-dev/aimdb/releases/tag/v0.1.0

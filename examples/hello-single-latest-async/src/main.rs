@@ -1,0 +1,81 @@
+use aimdb_core::{buffer::BufferCfg, AimDbBuilder, Consumer, Producer, RuntimeContext};
+use aimdb_tokio_adapter::{TokioAdapter, TokioRecordRegistrarExt};
+use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Clone, Debug)]
+struct FeatureGate {
+    rollout_percent: u8,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let key_config_checkout_rollout_1 =
+        aimdb_core::Name::<FeatureGate>::new("config.checkout_rollout");
+    println!("=== hello-single-latest-async: SingleLatest buffer demo ===\n");
+
+    let adapter = Arc::new(TokioAdapter::new()?);
+    let mut builder = AimDbBuilder::new().runtime(adapter);
+
+    builder.configure(key_config_checkout_rollout_1, |reg| {
+        reg.buffer(BufferCfg::SingleLatest)
+            .source(rollout_source)
+            .tap(rollout_observer);
+    });
+
+    let (_db, runner) = builder.build().await?;
+    // Drive the database futures concurrently with the demo's wait — without
+    // this the registered source/tap futures never run.
+    tokio::spawn(runner.run());
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    println!("Done. SingleLatest keeps only the current value for each subscriber.");
+
+    Ok(())
+}
+
+async fn rollout_source(ctx: RuntimeContext, producer: Producer<FeatureGate>) {
+    let time = ctx.time();
+
+    time.sleep_millis(50).await;
+
+    for rollout_percent in [0, 10, 25] {
+        publish_rollout(&producer, rollout_percent).await;
+    }
+
+    for rollout_percent in [50, 100] {
+        time.sleep_millis(120).await;
+        publish_rollout(&producer, rollout_percent).await;
+    }
+}
+
+async fn publish_rollout(producer: &Producer<FeatureGate>, rollout_percent: u8) {
+    let gate = FeatureGate { rollout_percent };
+    producer.produce(gate);
+}
+
+async fn rollout_observer(ctx: RuntimeContext, consumer: Consumer<FeatureGate>) {
+    let mut reader = consumer.subscribe();
+    let time = ctx.time();
+
+    let mut first = true;
+    while let Ok(gate) = reader.recv().await {
+        if first {
+            first = false;
+            if gate.value.rollout_percent != 0 {
+                println!(
+                    "   (rollouts before {}% were overwritten before the tap could read them - SingleLatest keeps only the latest)",
+                    gate.value.rollout_percent
+                );
+            }
+        }
+        println!(
+            "tap observed current rollout: {}%",
+            gate.value.rollout_percent
+        );
+        if gate.value.rollout_percent == 100 {
+            break;
+        }
+        time.sleep_millis(90).await;
+    }
+}

@@ -1,0 +1,87 @@
+[package]
+name = "aimdb-wasm-adapter"
+version = "0.4.0"
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "WebAssembly runtime adapter for AimDB - browser-native async runtime support"
+keywords = ["wasm", "webassembly", "browser", "async", "database"]
+categories = ["wasm", "asynchronous", "database-implementations"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["wasm-runtime"]
+
+# Runtime features
+wasm-runtime = [
+    "wasm-bindgen",
+    "wasm-bindgen-futures",
+    "js-sys",
+    "web-sys",
+    "serde-wasm-bindgen",
+]
+observability = ["aimdb-core/observability"]
+
+[dependencies]
+# Core AimDB types (no std, no tokio — the connector-session engines and the
+# AimX codec cross-compile to wasm32; the bridge rides `run_client`)
+aimdb-core = { version = "3.0.0", path = "../aimdb-core", default-features = false, features = [
+    "alloc",
+    "connector-session",
+    "remote",
+] }
+
+# Data contracts (alloc only — no std)
+aimdb-data-contracts = { version = "0.3.0", path = "../aimdb-data-contracts", default-features = false, features = [
+    "alloc", "aimdb-core",
+] }
+
+# WASM bindings
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+    "console",
+    "CustomEvent",
+    "CustomEventInit",
+    "EventTarget",
+    "MessageEvent",
+    "Performance",
+    "WebSocket",
+    "Window",
+] }
+
+# Serialization (no_std + alloc)
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+
+# Async utilities (minimal, no_std compatible)
+futures-util = { version = "0.3", default-features = false, features = [
+    "alloc",
+    "sink",
+] }
+
+# Bounded MPSC channel for join fan-in.
+# Note: futures-channel mpsc requires "std" because its internal BiLock uses std::sync.
+# The "alloc"-only path does not expose mpsc; "std" is the minimum required feature.
+futures-channel = { version = "0.3", default-features = false, features = ["std", "sink"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("std"))',
+] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# Host-only: drives the async `aimdb-core` buffer contract suite via
+# `futures::executor::block_on` in the native (`cargo test`) lane. Target-gated
+# off wasm32 so the `std`-backed executor never enters the wasm-pack build.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+futures = { workspace = true }

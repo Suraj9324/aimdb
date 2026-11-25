@@ -1,0 +1,18 @@
+//! Outbound path: connectors pull serialized messages from their routes.
+
+pub(crate) mod events;
+
+mod latest;
+mod ready;
+mod routes;
+
+pub(crate) use latest::{LatestFn, Rendered};
+pub use latest::{LatestMessage, OutboundLatest};
+pub use routes::{OutboundMessage, OutboundPayload, OutboundRoutes, RouteInfo, RouteStats};
+pub(crate) use routes::{
+    PollRoute, RouteFactoryFn, RouteOutcome, RouteParts, SerializeFailure, StagedPayload,
+};
+
+/// Dense route index, `0..routes().len()`. A plain `usize`, so a connector
+/// indexes its own per-route tables with it.
+pub type RouteId = usize;

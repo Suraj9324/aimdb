@@ -1,0 +1,96 @@
+//! Remote access subsystem for AimDB (AimX protocol)
+//!
+//! Provides introspection and management APIs over Unix domain sockets,
+//! enabling external tools (CLI, dashboards, MCP adapters) to interact
+//! with running AimDB instances.
+//!
+//! # Protocol
+//!
+//! AimX uses NDJSON (newline-delimited JSON) tagged frames over a session
+//! transport (Unix domain sockets via `aimdb-uds-connector`, serial via
+//! `aimdb-serial-connector`). The envelope codec lives in `session::aimx`
+//! (feature `connector-session`). Compatibility is by major version — see
+//! [`PROTOCOL_VERSION`] and [`version_compatible`].
+//!
+//! # Security
+//!
+//! - **Read-only by default**: No writes unless explicitly enabled
+//! - **UDS permissions**: Primary security mechanism (file permissions)
+//! - **Optional auth tokens**: Additional authentication layer
+//! - **Per-record write permissions**: Explicit opt-in required
+//!
+//! # Usage
+//!
+//! Remote access is registered like any other connector — via `with_connector`
+//! using `aimdb_uds_connector::UdsServer` (this replaced the former
+//! `AimDbBuilder::with_remote_access(config)`). Illustrative (not compiled:
+//! the connector lives in a downstream crate `aimdb-core` cannot depend on):
+//!
+//! ```rust,ignore
+//! use aimdb_core::remote::{AimxConfig, SecurityPolicy};
+//! use aimdb_uds_connector::UdsServer;
+//!
+//! let config = AimxConfig::uds_default()
+//!     .socket_path("/var/run/aimdb/aimdb.sock")
+//!     .security_policy(SecurityPolicy::ReadOnly)
+//!     .max_connections(16)
+//!     .max_subs_per_connection(32);
+//!
+//! let (db, runner) = AimDbBuilder::new()
+//!     .runtime(tokio_adapter)
+//!     .with_connector(UdsServer::from_config(config))
+//!     .build()
+//!     .await?;
+//! ```
+
+mod config;
+mod error;
+mod instance;
+mod metadata;
+mod protocol;
+mod query;
+
+pub use config::{AimxConfig, SecurityPolicy};
+pub use error::{RemoteError, RemoteResult};
+pub use instance::{instance_info_reply, post_link_chunk_reply, PostLinkError};
+pub use metadata::{InboundKeysInfo, RecordMetadata};
+pub use protocol::{
+    version_compatible, ws_url_with_version, BuildReply, HelloMessage, InstanceIdentityReply,
+    InstanceInfoReply, PostLinkChunk, PostLinkReply, WelcomeMessage, INSTANCE_INFO_REPLY_MAX,
+    POST_LINK_CHUNK_MAX, PROTOCOL_VERSION, VERSION_PARAM,
+};
+pub use query::{
+    QueryHandlerFn, QueryHandlerParams, QueryRecord, DEFAULT_QUERY_LIMIT, QUERY_ALL_PATTERN,
+};
+
+// Internal exports for implementation
+#[cfg(feature = "connector-session")]
+pub(crate) mod stream;
+
+/// The leaf (entity) segment of a record key — the trailing component after the
+/// last separator. Both `.` and `/` are treated as delimiters, since keys use
+/// either convention (`temp.vienna` or `sensors/temp/vienna`), and both yield
+/// `vienna`. Servers report this as a record's `entity`, which identifies the
+/// node only where the leaf *is* the node: `station.17.temperature` yields
+/// `temperature`, not `17`.
+pub fn topic_leaf(key: &str) -> &str {
+    key.rsplit(['.', '/']).next().unwrap_or(key)
+}
+
+#[cfg(test)]
+mod topic_leaf_tests {
+    use super::topic_leaf;
+
+    #[test]
+    fn leaf_handles_both_separators() {
+        // Dot convention.
+        assert_eq!(topic_leaf("temp.vienna"), "vienna");
+        // Slash convention (the bug: `rsplit('.')` returned the whole key).
+        assert_eq!(topic_leaf("sensors/temp/vienna"), "vienna");
+        // Mixed — the last separator of either kind wins.
+        assert_eq!(topic_leaf("sensors/temp.vienna"), "vienna");
+        assert_eq!(topic_leaf("a.b/c"), "c");
+        // No separator: the whole key is its own leaf.
+        assert_eq!(topic_leaf("vienna"), "vienna");
+    }
+}

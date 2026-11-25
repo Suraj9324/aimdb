@@ -1,0 +1,510 @@
+//! Tokio implementations of core's runtime-neutral I/O traits — the std dual of
+//! the Embassy adapter's `net` module.
+//!
+//! Every future here is a plain `async fn`: the compiler proves it `Send`, so
+//! the `+ Send` the traits declare on their return types costs nothing and this
+//! module contains no `unsafe`. The Embassy side, whose socket futures are
+//! `!Send`, wraps them instead — that asymmetry is why the bound sits on the
+//! trait rather than at each use site.
+
+use std::net::{IpAddr, SocketAddr};
+
+use aimdb_core::session::{
+    ByteRead, ByteStream, ByteWrite, Datagram, DatagramBinder, Delay, PeerInfo, StreamDialer,
+    StreamListener, TransportError, TransportResult,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+
+/// Entry point for the Tokio transports.
+pub struct TokioNet;
+
+impl TokioNet {
+    /// A TCP dialer. Name resolution happens here, so a connector hands over a
+    /// host string and never touches `std::net`.
+    pub fn tcp() -> TokioTcpDialer {
+        TokioTcpDialer
+    }
+
+    /// Bind a TCP listener on `addr` (`"host:port"`).
+    ///
+    /// Yields `std::io::Error` rather than [`TransportError`], which cannot
+    /// carry a cause: it is `Clone + PartialEq + Eq` in a `no_std` crate. A bind
+    /// failure is one an operator has to act on and cannot infer — the port is
+    /// taken, the port is privileged, the interface is absent — and only the OS
+    /// distinguishes them. This is a constructor, not a trait method, so it is
+    /// free to say which.
+    pub async fn listen(addr: &str) -> std::io::Result<TokioTcpListener> {
+        TcpListener::bind(addr).await.map(TokioTcpListener)
+    }
+
+    /// A UDP binder on `local_ip`, which sockets are bound to as
+    /// `local_ip:port`. Pass [`Ipv4Addr::UNSPECIFIED`](std::net::Ipv4Addr) for
+    /// any interface.
+    pub fn udp(local_ip: impl Into<IpAddr>) -> TokioUdpBinder {
+        TokioUdpBinder {
+            local_ip: local_ip.into(),
+        }
+    }
+
+    /// The clock, as a non-boxing [`Delay`].
+    pub fn delay() -> TokioDelay {
+        TokioDelay
+    }
+}
+
+// ===========================================================================
+// Streams.
+// ===========================================================================
+
+/// Any Tokio async byte source as a [`ByteStream`] — a `TcpStream`, a
+/// `tokio::io::duplex` pipe, a serial port.
+pub struct TokioByteStream<S>(pub S);
+
+impl<S> ByteStream for TokioByteStream<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    async fn read(&mut self, buf: &mut [u8]) -> TransportResult<usize> {
+        self.0.read(buf).await.map_err(|_| TransportError::Io)
+    }
+
+    async fn write_all(&mut self, buf: &[u8]) -> TransportResult<()> {
+        self.0
+            .write_all(buf)
+            .await
+            .map_err(|_| TransportError::Closed)
+    }
+
+    async fn flush(&mut self) -> TransportResult<()> {
+        self.0.flush().await.map_err(|_| TransportError::Closed)
+    }
+
+    /// Borrow the stream as halves through `tokio::io::split`.
+    ///
+    /// This costs a lock taken inside each `poll` — never held across an await,
+    /// so it cannot deadlock, but a serialisation point the native
+    /// `TcpStream::split` does not have. That one is unreachable here: this type
+    /// is generic over `S`, so a `TcpStream`-specialised impl would overlap it.
+    fn split(&mut self) -> (impl ByteRead + Send + '_, impl ByteWrite + Send + '_) {
+        let (rx, tx) = tokio::io::split(&mut self.0);
+        (TokioReadHalf(rx), TokioWriteHalf(tx))
+    }
+}
+
+/// The read half of a split [`TokioByteStream`].
+struct TokioReadHalf<S>(tokio::io::ReadHalf<S>);
+
+/// The write half of a split [`TokioByteStream`].
+struct TokioWriteHalf<S>(tokio::io::WriteHalf<S>);
+
+impl<S> ByteRead for TokioReadHalf<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    async fn read(&mut self, buf: &mut [u8]) -> TransportResult<usize> {
+        self.0.read(buf).await.map_err(|_| TransportError::Io)
+    }
+}
+
+impl<S> ByteWrite for TokioWriteHalf<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    async fn write_all(&mut self, buf: &[u8]) -> TransportResult<()> {
+        self.0
+            .write_all(buf)
+            .await
+            .map_err(|_| TransportError::Closed)
+    }
+
+    async fn flush(&mut self) -> TransportResult<()> {
+        self.0.flush().await.map_err(|_| TransportError::Closed)
+    }
+}
+
+/// Dials TCP connections.
+#[derive(Clone, Copy, Default)]
+pub struct TokioTcpDialer;
+
+impl StreamDialer for TokioTcpDialer {
+    type Stream = TokioByteStream<TcpStream>;
+
+    async fn connect(&self, host: &str, port: u16) -> TransportResult<Self::Stream> {
+        TcpStream::connect((host, port))
+            .await
+            .map(TokioByteStream)
+            .map_err(|_| TransportError::Io)
+    }
+}
+
+/// The dialer is also the clock, so a connector generic over it needs no
+/// separate handle.
+impl Delay for TokioTcpDialer {
+    fn sleep(&self, d: std::time::Duration) -> impl std::future::Future<Output = ()> + Send {
+        TokioDelay.sleep(d)
+    }
+}
+
+/// Accepts TCP connections.
+pub struct TokioTcpListener(TcpListener);
+
+impl TokioTcpListener {
+    /// The address actually bound — the way to learn the port after binding
+    /// one of the ephemeral `:0` forms.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.0.local_addr().ok()
+    }
+}
+
+impl StreamListener for TokioTcpListener {
+    type Stream = TokioByteStream<TcpStream>;
+
+    async fn accept(&mut self) -> TransportResult<(Self::Stream, PeerInfo)> {
+        let (stream, addr) = self.0.accept().await.map_err(|_| TransportError::Io)?;
+        // `PeerInfo` is `#[non_exhaustive]`, so it is built by mutation.
+        let mut peer = PeerInfo::default();
+        peer.peer_addr = Some(addr.to_string());
+        Ok((TokioByteStream(stream), peer))
+    }
+}
+
+// `embedded-io-async` by delegation, so a protocol client written against those
+// traits (mountain-mqtt, embedded-tls) runs on a host. `ReadReady` is a
+// synchronous probe, so it takes the concrete `TcpStream` and its `poll_peek`.
+#[cfg(feature = "embedded-io")]
+mod embedded_io_impls {
+    use super::TokioByteStream;
+    use core::task::{Context, Poll, Waker};
+    use embedded_io_async::ErrorKind;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
+    use tokio::net::TcpStream;
+
+    impl<S> embedded_io_async::ErrorType for TokioByteStream<S> {
+        type Error = ErrorKind;
+    }
+
+    impl<S> embedded_io_async::Read for TokioByteStream<S>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            self.0.read(buf).await.map_err(|e| e.kind().into())
+        }
+    }
+
+    impl<S> embedded_io_async::Write for TokioByteStream<S>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            self.0.write(buf).await.map_err(|e| e.kind().into())
+        }
+
+        async fn flush(&mut self) -> Result<(), Self::Error> {
+            self.0.flush().await.map_err(|e| e.kind().into())
+        }
+    }
+
+    impl embedded_io_async::ReadReady for TokioByteStream<TcpStream> {
+        fn read_ready(&mut self) -> Result<bool, Self::Error> {
+            let mut byte = [0u8; 1];
+            let mut buf = ReadBuf::new(&mut byte);
+            // MSG_PEEK leaves the byte queued. `Ok(0)` is EOF, which counts as
+            // ready: a read returns immediately rather than blocking.
+            match self
+                .0
+                .poll_peek(&mut Context::from_waker(Waker::noop()), &mut buf)
+            {
+                Poll::Ready(Ok(_)) => Ok(true),
+                Poll::Ready(Err(e)) => Err(e.kind().into()),
+                Poll::Pending => Ok(false),
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Datagrams.
+// ===========================================================================
+
+/// One bound Tokio UDP socket as a [`Datagram`].
+pub struct TokioDatagram {
+    socket: UdpSocket,
+    local: Option<SocketAddr>,
+}
+
+impl Datagram for TokioDatagram {
+    async fn send_to(&mut self, buf: &[u8], to: SocketAddr) -> TransportResult<()> {
+        self.socket
+            .send_to(buf, to)
+            .await
+            .map(|_| ())
+            .map_err(|_| TransportError::Io)
+    }
+
+    async fn recv_from(&mut self, buf: &mut [u8]) -> TransportResult<(usize, SocketAddr)> {
+        self.socket
+            .recv_from(buf)
+            .await
+            .map_err(|_| TransportError::Io)
+    }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        self.local
+    }
+}
+
+/// Binds [`TokioDatagram`]s, one per reconnect cycle.
+#[derive(Clone, Copy)]
+pub struct TokioUdpBinder {
+    local_ip: IpAddr,
+}
+
+impl DatagramBinder for TokioUdpBinder {
+    type Socket = TokioDatagram;
+
+    async fn bind(&self, port: u16) -> TransportResult<Self::Socket> {
+        let socket = UdpSocket::bind(SocketAddr::new(self.local_ip, port))
+            .await
+            .map_err(|_| TransportError::Io)?;
+        let local = socket.local_addr().ok();
+        Ok(TokioDatagram { socket, local })
+    }
+}
+
+// ===========================================================================
+// Clock.
+// ===========================================================================
+
+/// [`Delay`] over `tokio::time::sleep`, returning the timer itself rather than
+/// a boxed future.
+#[derive(Clone, Copy, Default)]
+pub struct TokioDelay;
+
+impl Delay for TokioDelay {
+    fn sleep(&self, d: std::time::Duration) -> impl std::future::Future<Output = ()> + Send {
+        tokio::time::sleep(d)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aimdb_core::session::{
+        Dialer, FrameFault, Framer, FramingDialer, FramingListener, Listener,
+    };
+    use std::net::Ipv4Addr;
+
+    /// Length-prefixed framer, enough to drive a `FramedConnection`.
+    #[derive(Default)]
+    struct LenFramer {
+        buf: Vec<u8>,
+    }
+
+    impl Framer for LenFramer {
+        fn encode(&self, frame: &[u8], out: &mut Vec<u8>) -> Result<(), FrameFault> {
+            out.push(frame.len() as u8);
+            out.extend_from_slice(frame);
+            Ok(())
+        }
+        fn push_bytes(&mut self, bytes: &[u8]) {
+            self.buf.extend_from_slice(bytes);
+        }
+        fn next_frame(&mut self) -> Option<Result<Vec<u8>, FrameFault>> {
+            let len = *self.buf.first()? as usize;
+            if self.buf.len() < len + 1 {
+                return None;
+            }
+            let frame = self.buf[1..len + 1].to_vec();
+            self.buf.drain(..len + 1);
+            Some(Ok(frame))
+        }
+    }
+
+    /// A bind failure names its cause. `TransportError` cannot carry one, so
+    /// `listen` yields `io::Error` — the difference between "port taken",
+    /// "port privileged" and "no such interface" is the whole content of the
+    /// error, and an operator cannot infer it from the address they supplied.
+    #[tokio::test]
+    async fn a_failed_bind_reports_why() {
+        let held = TokioNet::listen("127.0.0.1:0").await.expect("first bind");
+        let addr = held.local_addr().expect("bound addr");
+
+        let Err(err) = TokioNet::listen(&addr.to_string()).await else {
+            panic!("binding a held port must fail");
+        };
+
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AddrInUse,
+            "the OS reason must survive, not collapse to a bare Io"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_round_trips_between_dialer_and_listener() {
+        let mut listener = TokioNet::listen("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, peer) = listener.accept().await.unwrap();
+            assert!(
+                peer.peer_addr.is_some(),
+                "accept must carry the peer address"
+            );
+            let mut buf = [0u8; 16];
+            let n = stream.read(&mut buf).await.unwrap();
+            stream.write_all(&buf[..n]).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let mut client = TokioNet::tcp().connect("127.0.0.1", port).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_closed_peer_reads_as_eof() {
+        let mut listener = TokioNet::listen("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+
+        let mut client = TokioNet::tcp().connect("127.0.0.1", port).await.unwrap();
+        server.await.unwrap();
+        let mut buf = [0u8; 16];
+        assert_eq!(client.read(&mut buf).await.unwrap(), 0, "EOF is Ok(0)");
+    }
+
+    /// The transports drive core's `Dialer`/`Listener` unchanged, which is the
+    /// point of the adapter owning sockets.
+    #[tokio::test]
+    async fn the_transports_drive_a_framed_connection() {
+        let listener = TokioNet::listen("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut listener: FramingListener<_, _, 256, 256> =
+            FramingListener::new(listener, LenFramer::default);
+
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let frame = conn.recv().await.unwrap().unwrap();
+            conn.send(&frame).await.unwrap();
+        });
+
+        let dialer: FramingDialer<_, _, 256, 256> =
+            FramingDialer::new(TokioNet::tcp(), LenFramer::default, "127.0.0.1", port);
+        let mut conn = dialer.connect().await.unwrap();
+        conn.send(b"hello").await.unwrap();
+        assert_eq!(conn.recv().await.unwrap(), Some(b"hello".to_vec()));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_round_trips_and_reports_its_bound_address() {
+        let binder = TokioNet::udp(Ipv4Addr::LOCALHOST);
+        let mut a = binder.bind(0).await.unwrap();
+        let mut b = binder.bind(0).await.unwrap();
+
+        let a_addr = a.local_addr().expect("a bound address must be reported");
+        let b_addr = b.local_addr().expect("a bound address must be reported");
+        assert_ne!(
+            a_addr.port(),
+            0,
+            "an ephemeral bind resolves to a real port"
+        );
+
+        a.send_to(b"knx", b_addr).await.unwrap();
+        let mut buf = [0u8; 16];
+        let (n, from) = b.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"knx");
+        assert_eq!(from, a_addr, "the source address must be the sender's");
+    }
+
+    /// Rebinding is what the KNX socket reset needs: a fresh socket each cycle,
+    /// on the same binder.
+    #[tokio::test]
+    async fn a_binder_can_rebind_after_its_socket_is_dropped() {
+        let binder = TokioNet::udp(Ipv4Addr::LOCALHOST);
+        let first = binder.bind(0).await.unwrap();
+        let port = first.local_addr().unwrap().port();
+        drop(first);
+
+        let second = binder.bind(port).await.unwrap();
+        assert_eq!(second.local_addr().unwrap().port(), port);
+    }
+
+    /// The probe must not consume what it reports.
+    #[cfg(feature = "embedded-io")]
+    #[tokio::test]
+    async fn the_embedded_io_trio_round_trips_and_probes_without_consuming() {
+        use embedded_io_async::{Read, ReadReady, Write};
+
+        let mut listener = TokioNet::listen("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 16];
+            let n = Read::read(&mut stream, &mut buf).await.unwrap();
+            Write::write(&mut stream, &buf[..n]).await.unwrap();
+            Write::flush(&mut stream).await.unwrap();
+        });
+
+        let mut client = TokioNet::tcp().connect("127.0.0.1", port).await.unwrap();
+        assert!(
+            !client.read_ready().unwrap(),
+            "nothing sent yet, so the probe must not claim readiness"
+        );
+
+        Write::write(&mut client, b"ping").await.unwrap();
+        Write::flush(&mut client).await.unwrap();
+        server.await.unwrap();
+
+        // The peek must leave the byte queued: the read below is what proves it.
+        assert!(client.read_ready().unwrap(), "the echo is waiting");
+        assert!(
+            client.read_ready().unwrap(),
+            "and probing did not consume it"
+        );
+
+        let mut buf = [0u8; 16];
+        let n = Read::read(&mut client, &mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping");
+    }
+
+    /// EOF counts as ready: a read returns `Ok(0)` without blocking.
+    #[cfg(feature = "embedded-io")]
+    #[tokio::test]
+    async fn the_readiness_probe_reports_eof_as_ready() {
+        use embedded_io_async::ReadReady;
+
+        let mut listener = TokioNet::listen("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+
+        let mut client = TokioNet::tcp().connect("127.0.0.1", port).await.unwrap();
+        server.await.unwrap();
+        // Give the FIN a moment to land, then the probe must say "ready".
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(client.read_ready().unwrap());
+    }
+
+    #[tokio::test]
+    async fn delay_sleeps_without_boxing() {
+        let start = std::time::Instant::now();
+        TokioNet::delay()
+            .sleep(std::time::Duration::from_millis(20))
+            .await;
+        assert!(start.elapsed() >= std::time::Duration::from_millis(15));
+    }
+}

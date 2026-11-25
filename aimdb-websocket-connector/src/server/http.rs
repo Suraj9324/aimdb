@@ -1,0 +1,360 @@
+//! Axum WebSocket server and upgrade handler.
+//!
+//! The server is started by [`start_server`] which binds to the configured
+//! address, mounts the WebSocket endpoint at the configured path, and
+//! optionally mounts additional user-provided Axum routes.
+//!
+//! # Upgrade gates
+//!
+//! [`ws_upgrade_handler`] refuses a connection before the socket opens, with the
+//! status saying why: `426` for an incompatible AimX version, `503` once
+//! `with_max_clients` connections are live, `401` when the [`AuthHandler`]
+//! rejects. A slot for the cap is claimed at admission and released when the
+//! session ends, so `/health`'s count is exact from the moment the 101 goes out.
+//!
+//! # Health endpoint
+//!
+//! `GET /health` returns `200 OK` with a JSON body:
+//! ```json
+//! { "status": "ok", "clients": 3, "uptime_secs": 120 }
+//! ```
+//!
+//! # Version endpoint
+//!
+//! `GET /version` returns `200 OK` with the AimX major.minor this server
+//! speaks:
+//! ```json
+//! { "aimx": "3.1" }
+//! ```
+//!
+//! It exists because the upgrade-time version gate below answers an
+//! incompatible client with HTTP 426, and a browser cannot read that: the
+//! WebSocket API surfaces a failed upgrade as an opaque `error` event with no
+//! status and no body, so a refusing hub and an unreachable one are
+//! indistinguishable from JavaScript. A browser client fetches this route
+//! before dialing and can then name both versions in its error.
+
+use crate::events::{report, WebSocketEvent};
+
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant};
+
+use aimdb_core::{
+    remote::{version_compatible, PROTOCOL_VERSION, VERSION_PARAM},
+    session::{aimx::AimxCodec, run_session, SessionConfig},
+    Connection, Dispatch, PeerInfo, SessionLimits,
+};
+use axum::{
+    extract::{
+        ws::{WebSocket, WebSocketUpgrade},
+        ConnectInfo, Query, State,
+    },
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::get,
+    Json, Router,
+};
+use tower_http::cors::CorsLayer;
+
+use crate::transport::WsServerConnection;
+
+use super::{
+    auth::{AuthError, AuthRequest, ClientInfo, DynAuthHandler, RecordsBits},
+    client_manager::ClientManager,
+};
+
+// ════════════════════════════════════════════════════════════════════
+// Shared server state
+// ════════════════════════════════════════════════════════════════════
+
+/// State shared across upgrade/health handlers. The per-connection session engine
+/// (`run_session`) is driven from [`ws_upgrade_handler`]; only the *accept* loop
+/// stays axum's.
+#[derive(Clone)]
+pub(crate) struct ServerState {
+    /// Shared application dispatch (one `Arc<dyn Dispatch>` per server).
+    pub dispatch: Arc<dyn Dispatch>,
+    /// HTTP-upgrade authenticator (resolves identity before the engine runs).
+    pub auth: DynAuthHandler,
+    /// Bus + connection counter (for client-id allocation and `/health`).
+    pub client_mgr: ClientManager,
+    /// Patterns to auto-subscribe each client to on connect.
+    pub auto_subscribe: Arc<Vec<String>>,
+    /// Maximum number connection allowed
+    pub max_clients: usize,
+    /// Per-connection subscription cap.
+    pub max_subs_per_connection: usize,
+    pub started_at: Instant,
+    /// List records' unique key, ordered by registration order
+    pub records: Arc<Vec<String>>,
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Server start
+// ════════════════════════════════════════════════════════════════════
+
+type BoxFuture = std::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send + 'static>>;
+
+/// Assemble the axum `Router`: the WS endpoint + `/health` + `/version`, with the shared
+/// [`ServerState`] and any user-supplied extra routes merged in.
+fn build_app(ws_path: &str, state: ServerState, additional_routes: Option<Router>) -> Router {
+    // Apply state first so the router becomes `Router<()>`, which can then be
+    // merged with user-supplied `additional_routes: Router<()>` without a
+    // type-parameter mismatch.
+    let ws_app = Router::new()
+        .route(ws_path, get(ws_upgrade_handler))
+        .route("/health", get(health_handler))
+        .route("/version", get(version_handler))
+        .with_state(state)
+        .layer(CorsLayer::permissive());
+
+    match additional_routes {
+        Some(extra) => ws_app.merge(extra),
+        None => ws_app,
+    }
+}
+
+/// Bind `bind_addr` and serve [`build_app`] as the connector's runner future
+/// (the axum accept loop). Each upgraded socket is driven by `run_session`.
+pub(crate) fn build_server_future(
+    bind_addr: SocketAddr,
+    ws_path: String,
+    state: ServerState,
+    additional_routes: Option<Router>,
+) -> BoxFuture {
+    let app = build_app(&ws_path, state, additional_routes);
+
+    Box::pin(async move {
+        let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+            Ok(l) => l,
+            Err(_e) => {
+                report(WebSocketEvent::BindFailed {
+                    address: bind_addr,
+                    error: &_e,
+                });
+                return;
+            }
+        };
+
+        report(WebSocketEvent::Listening { address: bind_addr });
+
+        if let Err(_e) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
+            report(WebSocketEvent::ServerFailed { error: &_e });
+        }
+    })
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Handlers
+// ════════════════════════════════════════════════════════════════════
+
+/// WebSocket upgrade handler.
+///
+/// Performs authentication before agreeing to upgrade; rejects unauthenticated
+/// connections with HTTP 401.
+async fn ws_upgrade_handler(
+    ws: WebSocketUpgrade,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query_params): Query<HashMap<String, String>>,
+    State(state): State<ServerState>,
+) -> impl IntoResponse {
+    let auth_req = AuthRequest {
+        headers,
+        query_params,
+        remote_addr,
+    };
+    // Connection cap, refused with 503 before the socket opens. The slot is
+    // claimed here rather than in `WsDispatch::open` so the check and the
+    // increment are one atomic step: `open` runs inside `run_session`, after the
+    // 101 is already on the wire, so a count read here would not yet include the
+    // connection admitted a moment ago and concurrent upgrades would all pass.
+    //
+    // WARNING: a connection lost without a TCP FIN (cut cable, NAT or firewall
+    // dropping the flow) holds its slot until the socket is noticed as dead —
+    // the server neither pings nor times out idle connections.
+    let max_clients = state.max_clients as u64;
+    let Some(conn_guard) = state.client_mgr.try_connection_guard(max_clients) else {
+        report(WebSocketEvent::ConnectionLimitReached {
+            peer: remote_addr,
+            limit: max_clients,
+        });
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("maximum connected clients of {} reached", max_clients),
+        )
+            .into_response();
+    };
+
+    // Protocol-version gate, before auth: the socket transports negotiate the
+    // version inside `hello`, but the WS server runs `reads_hello:false` and a
+    // browser cannot set handshake headers — so the client declares its version
+    // in the URL (`?v=3.1`, see `ws_url_with_version`). A missing or
+    // major-incompatible version is refused here with 426 so a stale client
+    // fails at the upgrade rather than on its first frame's new shape. Absent
+    // fails closed (`version_compatible("")` is false), matching the socket gate.
+    let client_version = auth_req
+        .query_params
+        .get(VERSION_PARAM)
+        .map(String::as_str)
+        .unwrap_or_default();
+    if !version_compatible(client_version) {
+        report(WebSocketEvent::VersionRejected {
+            peer: remote_addr,
+            client_version,
+            server_version: PROTOCOL_VERSION,
+        });
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            format!("incompatible AimX protocol version (server speaks {PROTOCOL_VERSION})"),
+        )
+            .into_response();
+    }
+
+    // Authenticate at the HTTP upgrade — returns permissions or rejects (401).
+    let permissions = match state.auth.authenticate(&auth_req).await {
+        Ok(p) => p,
+        Err(AuthError { message }) => {
+            report(WebSocketEvent::AuthenticationRejected {
+                peer: remote_addr,
+                reason: &message,
+            });
+            return (StatusCode::UNAUTHORIZED, message).into_response();
+        }
+    };
+
+    // Build record bits based on permissions.read_patterns
+    let record_perms = Arc::new(RecordsBits::resolve_permissions(
+        &state.records,
+        &permissions,
+    ));
+
+    // Resolve identity synchronously, before the upgrade, and carry it into the
+    // engine via `PeerInfo::ext` (WS-style `reads_hello:false`).
+    let id = state.client_mgr.next_client_id();
+    let info = ClientInfo {
+        id,
+        remote_addr,
+        permissions,
+        record_perms,
+    };
+
+    aimdb_core::log_debug!(
+        "{}: upgrading WebSocket connection from {}",
+        id,
+        remote_addr
+    );
+
+    let dispatch = state.dispatch.clone();
+    let auto_subscribe = state.auto_subscribe.clone();
+    let config = SessionConfig {
+        limits: SessionLimits {
+            // The engine's own connection limit stays off: axum owns the accept
+            // loop, and the cap is enforced above by `try_connection_guard`.
+            max_connections: usize::MAX,
+            max_subs_per_connection: state.max_subs_per_connection,
+        },
+        reads_hello: false,
+        acks_subscribe: true,
+    };
+
+    ws.on_upgrade(move |socket: WebSocket| async move {
+        // Move the guard here, dropped when connection ends
+        // WsSession will no longer hold the guard, as the api currently does not allow that
+        let _conn_guard = conn_guard;
+        let peer = PeerInfo::default().with_ext(Arc::new(info));
+        let conn: Box<dyn Connection> =
+            Box::new(WsServerConnection::new(socket, peer, &auto_subscribe));
+        // The shared AimX codec + run_session drive this socket; each codec blob
+        // rides as one WS text frame.
+        run_session(conn, &AimxCodec, dispatch.as_ref(), &config).await;
+    })
+    .into_response()
+}
+
+/// Protocol-version endpoint — the readable half of the upgrade gate.
+///
+/// Returns [`PROTOCOL_VERSION`] as `{"aimx": "3.1"}`. Unlike the 426 the gate
+/// returns, this is reachable from a browser (the router's permissive CORS
+/// layer covers it), so a WASM/JS client can learn what the hub speaks before
+/// it dials and report a version mismatch instead of a bare connection
+/// failure. The body is exactly one field so the shape stays cheap to depend
+/// on; the same major-version rule as [`version_compatible`] applies to it.
+async fn version_handler() -> impl IntoResponse {
+    Json(serde_json::json!({ "aimx": PROTOCOL_VERSION }))
+}
+
+/// Health check endpoint.
+async fn health_handler(State(state): State<ServerState>) -> impl IntoResponse {
+    let uptime_secs = state.started_at.elapsed().as_secs();
+    let clients = state.client_mgr.client_count();
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "clients": clients,
+        "uptime_secs": uptime_secs,
+    }))
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    struct UnusedDispatch;
+    impl Dispatch for UnusedDispatch {
+        fn authenticate<'a>(
+            &'a self,
+            _: &'a PeerInfo,
+            _: Option<&'a [u8]>,
+        ) -> aimdb_core::session::BoxFut<
+            'a,
+            Result<aimdb_core::session::SessionCtx, aimdb_core::session::AuthError>,
+        > {
+            Box::pin(async { Err(aimdb_core::session::AuthError::Unauthorized) })
+        }
+        fn open(
+            &self,
+            _: &aimdb_core::session::SessionCtx,
+        ) -> Box<dyn aimdb_core::session::Session> {
+            unreachable!("bind fails before dispatch")
+        }
+    }
+    #[tokio::test]
+    async fn bind_failure_is_observable_without_a_tracing_subscriber() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let observer = {
+            let seen = seen.clone();
+            Arc::new(move |event: &WebSocketEvent<'_>| {
+                match event {
+                    WebSocketEvent::BindFailed {
+                        address: actual, ..
+                    } => assert_eq!(*actual, address),
+                    other => panic!("unexpected {other:?}"),
+                }
+                seen.store(true, core::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        let state = ServerState {
+            dispatch: Arc::new(UnusedDispatch),
+            auth: Arc::new(super::super::auth::NoAuth),
+            client_mgr: ClientManager::new(8),
+            auto_subscribe: Arc::new(Vec::new()),
+            max_clients: 1,
+            max_subs_per_connection: 1,
+            started_at: Instant::now(),
+            records: Arc::new(Vec::new()),
+        };
+        crate::events::capture::future(
+            observer,
+            build_server_future(address, "/ws".into(), state, None),
+        )
+        .await;
+        assert!(seen.load(core::sync::atomic::Ordering::Relaxed));
+        drop(listener);
+    }
+}

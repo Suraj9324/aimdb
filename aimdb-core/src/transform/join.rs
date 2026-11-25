@@ -1,0 +1,404 @@
+use crate::transform::events::{report, TransformEvent};
+
+use core::any::{type_name, Any, TypeId};
+use core::fmt::Debug;
+use core::marker::PhantomData;
+
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
+
+use crate::executor::{ExecutorError, ExecutorResult};
+
+use crate::transform::{CollectedTransform, TransformDescriptor};
+use crate::typed_record::BoxFuture;
+
+// ============================================================================
+// Fan-in queue
+// ============================================================================
+
+/// Capacity of the bounded fan-in channel between input forwarders and the
+/// trigger loop. Sized per target to match the per-adapter GAT queue family
+/// this replaces: 64 on std and wasm32 (tokio/WASM used 64 — a blocked
+/// forwarder stops draining its input buffer, so burst headroom matters
+/// there; the WASM adapter builds core without `std`, hence the target cfg).
+#[cfg(any(feature = "std", target_arch = "wasm32"))]
+const JOIN_QUEUE_CAPACITY: usize = 64;
+/// Embedded no_std: the Embassy queue this replaces used 8; 16 adds burst
+/// headroom at a few words of RAM per slot.
+#[cfg(not(any(feature = "std", target_arch = "wasm32")))]
+const JOIN_QUEUE_CAPACITY: usize = 16;
+
+/// One bounded queue for all runtimes — the same `async-channel` primitive the
+/// session engine already uses on tokio, Embassy, and WASM.
+fn join_channel() -> (
+    async_channel::Sender<JoinTrigger>,
+    async_channel::Receiver<JoinTrigger>,
+) {
+    async_channel::bounded(JOIN_QUEUE_CAPACITY)
+}
+
+// ============================================================================
+// JoinTrigger
+// ============================================================================
+
+/// Identifies which input produced a value in a multi-input join transform.
+///
+/// Passed to the event loop inside the closure registered with [`JoinBuilder::on_triggers`].
+/// Use [`JoinTrigger::index`] to branch on the source input and
+/// [`JoinTrigger::as_input`] to downcast the value to the concrete type.
+///
+/// # Why this carries `Box<dyn Any>`
+///
+/// This is the one deliberate exception to the data-plane de-erasure
+/// A join fans N *differently-typed* inputs into a single
+/// trigger channel, and the user's `on_triggers` closure branches on them
+/// via [`JoinTrigger::as_input`] — the erasure *is* the public API here, not
+/// an implementation accident. Removing it would mean N channels or a
+/// generated input enum, i.e. a different feature. The cost (one box +
+/// downcast per join input value) is confined to this module and applies
+/// only to explicit user-built joins, never to the connector spine.
+pub enum JoinTrigger {
+    /// A value written to input `index`. `metadata` is the write metadata of
+    /// that input value; match with `..`, more fields may follow.
+    #[non_exhaustive]
+    Input {
+        index: usize,
+        value: Box<dyn Any + Send>,
+        metadata: crate::WriteMetadata,
+    },
+}
+
+impl JoinTrigger {
+    pub fn as_input<T: 'static>(&self) -> Option<&T> {
+        match self {
+            JoinTrigger::Input { value, .. } => value.downcast_ref::<T>(),
+        }
+    }
+
+    pub fn index(&self) -> usize {
+        match self {
+            JoinTrigger::Input { index, .. } => *index,
+        }
+    }
+
+    /// The write metadata of the input value. The join's output is a new
+    /// write with its own; pairing inputs on write time is an application
+    /// choice (design 058 §1).
+    pub fn metadata(&self) -> &crate::WriteMetadata {
+        match self {
+            JoinTrigger::Input { metadata, .. } => metadata,
+        }
+    }
+
+    /// When the input value was written, on the instance clock.
+    pub fn stamp(&self) -> crate::Stamp {
+        self.metadata().stamp()
+    }
+}
+
+// ============================================================================
+// JoinEventRx — trigger receiver
+// ============================================================================
+
+/// Receiver for join trigger events.
+///
+/// Obtained as the first argument to the [`JoinBuilder::on_triggers`] closure.
+/// Call `.recv().await` in a loop to consume trigger events from all input forwarders.
+/// Returns `Err` when all input forwarders have exited and the channel is closed.
+pub struct JoinEventRx {
+    inner: async_channel::Receiver<JoinTrigger>,
+}
+
+impl JoinEventRx {
+    fn new(inner: async_channel::Receiver<JoinTrigger>) -> Self {
+        Self { inner }
+    }
+
+    /// Receive the next trigger event.
+    ///
+    /// Returns `Ok(JoinTrigger)` when an input fires, or `Err` when all input
+    /// forwarders have dropped their senders — on every runtime, ending any
+    /// `while let Ok(_) = rx.recv().await` loop.
+    pub async fn recv(&mut self) -> ExecutorResult<JoinTrigger> {
+        self.inner
+            .recv()
+            .await
+            .map_err(|_| ExecutorError::QueueClosed)
+    }
+}
+
+// ============================================================================
+// JoinBuilder → JoinPipeline
+// ============================================================================
+
+/// Type-erased factory for creating a forwarder task for one join input.
+type JoinInputFactory = Box<
+    dyn FnOnce(
+            Arc<crate::AimDb>,
+            usize,
+            async_channel::Sender<JoinTrigger>,
+        ) -> BoxFuture<'static, ()>
+        + Send
+        + Sync,
+>;
+
+/// Configures a multi-input join transform.
+///
+/// Available on every runtime. The fan-in queue (bounded channel between input
+/// forwarders and the trigger loop) lives in core, with capacity 64 on std and
+/// wasm32 and 16 on embedded `no_std`.
+///
+/// Obtain via [`RecordRegistrar::transform_join`](crate::RecordRegistrar::transform_join).
+pub struct JoinBuilder<O> {
+    inputs: Vec<(String, JoinInputFactory)>,
+    /// Type each input is read as, parallel to `inputs`.
+    input_types: Vec<(TypeId, &'static str)>,
+    _phantom: PhantomData<O>,
+}
+
+impl<O> JoinBuilder<O>
+where
+    O: Send + Sync + Clone + Debug + 'static,
+{
+    pub(crate) fn new() -> Self {
+        Self {
+            inputs: Vec::new(),
+            input_types: Vec::new(),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Add an input to the join; its type is the key's.
+    pub fn input<K: crate::record_id::TypedKey>(self, key: K) -> Self {
+        self.input_dyn::<K::Contract>(key)
+    }
+    fn input_dyn<I>(mut self, key: impl crate::RecordKey) -> Self
+    where
+        I: Send + Sync + Clone + Debug + 'static,
+    {
+        let key_str = key.as_str().to_string();
+        let key_for_factory = key_str.clone();
+
+        let factory: JoinInputFactory = Box::new(
+            move |db: Arc<crate::AimDb>, index: usize, tx: async_channel::Sender<JoinTrigger>| {
+                Box::pin(async move {
+                    let consumer = match db.consumer_dyn::<I>(&key_for_factory) {
+                        Ok(c) => c,
+                        Err(_e) => {
+                            report(TransformEvent::JoinConsumerResolutionFailed {
+                                input: &key_for_factory,
+                                index,
+                                error: &_e,
+                            });
+                            return;
+                        }
+                    };
+                    let mut reader = consumer.subscribe();
+
+                    loop {
+                        let sample = match reader.recv().await {
+                            Ok(sample) => sample,
+                            // SPMC-ring overflow: the reader recovers (cursor
+                            // resets to the oldest live value), so a transient
+                            // lag must not permanently silence this input —
+                            // same policy as every other recv loop in core.
+                            Err(crate::DbError::BufferLagged { .. }) => {
+                                report(TransformEvent::JoinLagged {
+                                    input: &key_for_factory,
+                                    index,
+                                });
+                                continue;
+                            }
+                            // Buffer closed / fatal — the input record is gone.
+                            Err(_) => break,
+                        };
+                        // Box the value, not the `Stamped<I>`: `as_input::<I>()`
+                        // downcasts to `I` and would never match the envelope.
+                        let trigger = JoinTrigger::Input {
+                            index,
+                            metadata: *sample.metadata(),
+                            value: Box::new(sample.value),
+                        };
+                        if tx.send(trigger).await.is_err() {
+                            break;
+                        }
+                    }
+                }) as BoxFuture<'static, ()>
+            },
+        );
+
+        self.inputs.push((key_str, factory));
+        self.input_types.push((TypeId::of::<I>(), type_name::<I>()));
+        self
+    }
+
+    /// Complete the pipeline by providing an async task that owns the event loop and state.
+    ///
+    /// The closure receives a [`JoinEventRx`] to read trigger events and a `Producer<O>`
+    /// to emit output values. Both are owned — moved into the `async move` block — so the
+    /// closure can freely hold borrows across `.await` points and maintain any state it needs.
+    ///
+    /// The task runs until all input forwarders close (i.e., all upstream records stop producing).
+    ///
+    /// Illustrative (not compiled: fragment of a `transform_join` pipeline with
+    /// user-defined input types):
+    ///
+    /// ```rust,ignore
+    /// .on_triggers(|mut rx, producer| async move {
+    ///     let mut last_a: Option<f32> = None;
+    ///     let mut last_b: Option<f32> = None;
+    ///     while let Ok(trigger) = rx.recv().await {
+    ///         match trigger.index() {
+    ///             0 => last_a = trigger.as_input::<InputA>().copied(),
+    ///             1 => last_b = trigger.as_input::<InputB>().copied(),
+    ///             _ => {}
+    ///         }
+    ///         if let (Some(a), Some(b)) = (last_a, last_b) {
+    ///             producer.produce(compute(a, b));
+    ///         }
+    ///     }
+    /// })
+    /// ```
+    ///
+    /// # Pairing values that belong together
+    ///
+    /// The handler above pairs each new value with the other input's latest.
+    /// When both inputs change at about the same time, the first output pairs
+    /// a new value with an old one. If the inputs carry a field that says
+    /// which values belong together, emit only when it matches and consume
+    /// both values:
+    ///
+    /// ```rust,ignore
+    /// .on_triggers(|mut rx, producer| async move {
+    ///     let mut flow: Option<Flow> = None;
+    ///     let mut ret: Option<Return> = None;
+    ///     while let Ok(trigger) = rx.recv().await {
+    ///         match trigger.index() {
+    ///             0 => flow = trigger.as_input::<Flow>().cloned(),
+    ///             1 => ret = trigger.as_input::<Return>().cloned(),
+    ///             _ => {}
+    ///         }
+    ///         if let (Some(f), Some(r)) = (&flow, &ret) {
+    ///             // Or a tolerance on an application timestamp. `trigger.stamp()`
+    ///             // is the write time: "written within", not "measured within".
+    ///             if f.sample_id == r.sample_id {
+    ///                 producer.produce(Difference::of(f, r));
+    ///                 flow = None;
+    ///                 ret = None;
+    ///             }
+    ///         }
+    ///     }
+    /// })
+    /// ```
+    ///
+    /// - One value is retained per input, so an input running ahead skips
+    ///   cycles: Flow 2, Flow 3, Return 3 emits only cycle 3.
+    /// - Which cycles are skipped depends on the arrival order between inputs.
+    /// - Values produced together by one source are better published as one
+    ///   compound record, which needs no join.
+    ///
+    /// `transform_join_pairs_values_by_timestamp` in the Tokio adapter's
+    /// integration tests runs this handler, matching on timestamps.
+    pub fn on_triggers<F, Fut>(self, handler: F) -> JoinPipeline<O>
+    where
+        F: FnOnce(JoinEventRx, crate::Producer<O>) -> Fut + Send + 'static,
+        Fut: core::future::Future<Output = ()> + Send + 'static,
+    {
+        let inputs = self.inputs;
+        let input_types = self.input_types;
+        let input_keys_for_descriptor: Vec<String> =
+            inputs.iter().map(|(k, _)| k.clone()).collect();
+
+        JoinPipeline {
+            spawn_factory: Box::new(move |_| TransformDescriptor {
+                input_keys: input_keys_for_descriptor,
+                input_types,
+                build_fn: Box::new(move |producer, db, output_key, _profiling| {
+                    build_join_collected(db, inputs, producer, handler, output_key)
+                }),
+            }),
+        }
+    }
+}
+
+/// Completed multi-input join pipeline, ready to be registered on a record.
+///
+/// Produced by [`JoinBuilder::on_triggers`] and consumed by
+/// [`RecordRegistrar::transform_join`](crate::RecordRegistrar::transform_join). Not normally constructed directly.
+pub struct JoinPipeline<O: Send + Sync + Clone + Debug + 'static> {
+    pub(crate) spawn_factory: Box<dyn FnOnce(()) -> TransformDescriptor<O> + Send>,
+}
+
+impl<O> JoinPipeline<O>
+where
+    O: Send + Sync + Clone + Debug + 'static,
+{
+    pub(crate) fn into_descriptor(self) -> TransformDescriptor<O> {
+        (self.spawn_factory)(())
+    }
+}
+
+// ============================================================================
+// Join Transform Build (forwarders + handler future, both collected at build time)
+// ============================================================================
+
+fn build_join_collected<O, F, Fut>(
+    db: Arc<crate::AimDb>,
+    inputs: Vec<(String, JoinInputFactory)>,
+    producer: crate::Producer<O>,
+    handler: F,
+    output_key: &str,
+) -> CollectedTransform
+where
+    O: Send + Sync + Clone + Debug + 'static,
+    F: FnOnce(JoinEventRx, crate::Producer<O>) -> Fut + Send + 'static,
+    Fut: core::future::Future<Output = ()> + Send + 'static,
+{
+    // Output key is threaded in from the descriptor so diagnostics stay
+    // unambiguous when multiple records share output type `O`.
+    // Owned copies are build-time, one-shot allocations.
+    let output_key = output_key.to_string();
+    let input_keys: Vec<String> = inputs.iter().map(|(k, _)| k.clone()).collect();
+    log_info!(
+        "🔄 Join transform building: {:?} → '{}'",
+        input_keys,
+        output_key
+    );
+
+    let (tx, rx) = join_channel();
+
+    // Build all forwarder futures eagerly; they will be driven by AimDbRunner.
+    let fanin_futures: Vec<BoxFuture<'static, ()>> = inputs
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_key, factory))| {
+            let sender = tx.clone();
+            factory(db.clone(), index, sender)
+        })
+        .collect();
+
+    // Drop our local sender so the receiver closes once all forwarders exit.
+    drop(tx);
+
+    let task_future: BoxFuture<'static, ()> = Box::pin(async move {
+        log_debug!(
+            "✅ Join transform '{}' handing receiver to user task",
+            output_key
+        );
+
+        handler(JoinEventRx::new(rx), producer).await;
+
+        report(TransformEvent::JoinTaskExited {
+            output: &output_key,
+        });
+    });
+
+    CollectedTransform {
+        task_future,
+        fanin_futures,
+    }
+}

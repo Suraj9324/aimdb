@@ -1,0 +1,72 @@
+[package]
+name = "aimdb-cli"
+version = "0.8.0"
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Command-line interface for AimDB - development and administration tool"
+keywords = ["cli", "tool", "admin", "database", "debugging"]
+categories = ["command-line-utilities", "database"]
+
+[[bin]]
+name = "aimdb"
+path = "src/main.rs"
+
+[dependencies]
+# AimDB client library
+aimdb-client = { version = "0.8.0", path = "../../aimdb-client" }
+
+# Core dependencies - reuse protocol types from aimdb-core.
+# `observability` keeps the optional RecordMetadata fields (signal_stats,
+# stage_profiling, buffer metrics) in the client-side struct — without it
+# serde silently drops them from `record list --format json` output.
+aimdb-core = { version = "3.0.0", path = "../../aimdb-core", features = [
+    "std",
+    "observability",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+
+# CLI framework
+clap = { version = "4", features = ["derive", "cargo"] }
+
+# Async runtime (must match AimDB runtime)
+tokio = { version = "1", features = [
+    "net",
+    "io-util",
+    "rt-multi-thread",
+    "signal",
+    "macros",
+    "time",
+    "fs",
+] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Output formatting
+tabled = "0.22"
+colored = "3"
+chrono = "0.4"
+
+# Optional: YAML output
+serde_yaml = { version = "0.9", optional = true }
+
+[features]
+default = []
+yaml = ["serde_yaml"]
+# Add the serial transport to the endpoint resolver, so `--connect serial://…`
+# works. Off by default (pulls tokio-serial → libudev on Linux).
+transport-serial = ["aimdb-client/transport-serial"]
+# Add the TCP transport to the endpoint resolver, so `--connect tcp://HOST:PORT`
+# works.
+transport-tcp = ["aimdb-client/transport-tcp"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"

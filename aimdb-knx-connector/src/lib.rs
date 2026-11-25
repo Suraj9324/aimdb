@@ -1,0 +1,190 @@
+//! KNX/IP connector for AimDB
+//!
+//! Provides bidirectional KNX integration for AimDB records:
+//! - **Outbound**: Automatic publishing from AimDB to KNX group addresses
+//! - **Inbound**: Monitor KNX bus and produce into AimDB buffers
+//!
+//! ## Features
+//!
+//! No feature here names a runtime: `src/` mentions no adapter and no `std::`,
+//! and a runtime is chosen by *passing* an adapter's `DatagramBinder` and
+//! `Delay` to `KnxConnector::new`. A third runtime (FreeRTOS/lwIP) works with
+//! no edit to this crate.
+//!
+//! - `connector`: the whole connector — tunnel engine, connection task, and
+//!   `KnxConnector` — on `no_std + alloc`. This is the gate an embedded caller
+//!   enables.
+//! - `std`: `connector` plus core's `std`, knx-pico's std error impls, and the
+//!   back-compat DPT re-exports. Lifts `no_std`; adds no runtime.
+//! - `tracing`: Debug logging support (std)
+//! - `defmt`: Debug logging support (no_std)
+//!
+//! `tokio-runtime` and `embassy-runtime` are deprecated aliases for `std` and
+//! `connector` respectively, and `critical-section-std-impl` a deprecated
+//! no-op, kept for one release.
+//!
+//! ## Production Status
+//!
+//! **Current Version: 0.1.0 - Beta Quality**
+//!
+//! ✅ **Ready for production use with caveats:**
+//! - Core protocol implementation is stable
+//! - ACK handling and timeout detection implemented
+//! - Automatic reconnection on failures
+//! - Comprehensive unit tests
+//!
+//! ⚠️ **Known limitations:**
+//! - No KNX Secure support (plaintext only)
+//! - No group address discovery
+//! - Limited DPT helpers (use `knx-pico` crate)
+//! - Fire-and-forget publish (no bus-level confirmation)
+//!
+//! See README.md for full deployment guide.
+//!
+//! ## Tokio Usage (Standard Library)
+//!
+//! Requires the `connector` feature.
+//!
+//! ```no_run
+//! # #[cfg(feature = "connector")]
+//! # mod example {
+//! use aimdb_core::buffer::BufferCfg;
+//! use aimdb_core::AimDbBuilder;
+//! use aimdb_knx_connector::KnxConnector;
+//! use aimdb_tokio_adapter::net::{TokioDelay, TokioNet};
+//! use aimdb_tokio_adapter::{TokioAdapter, TokioRecordRegistrarExt};
+//! use std::net::Ipv4Addr;
+//! use std::sync::Arc;
+//!
+//! #[derive(Debug, Clone)]
+//! struct LightState {
+//!     is_on: bool,
+//! }
+//!
+//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//! let runtime = Arc::new(TokioAdapter::new()?);
+//!
+//! let mut builder = AimDbBuilder::new()
+//!     .runtime(runtime)
+//!     .with_connector(KnxConnector::new(
+//!         TokioNet::udp(Ipv4Addr::UNSPECIFIED),
+//!         TokioDelay,
+//!         "knx://192.168.1.19:3671",
+//!     ));
+//! let record_1 = aimdb_core::Name::<LightState>::new("light.state");
+//! builder.configure(record_1, |reg| {
+//!     reg.buffer(BufferCfg::SingleLatest)
+//!        // Inbound: Monitor KNX bus
+//!        .link_from("knx://1/0/7")
+//!        .with_deserializer(|_ctx, data: &[u8]| {
+//!            let is_on = data.first().map(|&b| b != 0).unwrap_or(false);
+//!            Ok(LightState { is_on })
+//!        })
+//!        .finish()
+//!        // Outbound: Send commands to KNX
+//!        .link_to("knx://1/0/8")
+//!        .with_serializer(|_ctx, state: &LightState| {
+//!            Ok(vec![if state.is_on { 1 } else { 0 }])
+//!        })
+//!        .finish();
+//! });
+//! let (db, runner) = builder.build().await?;
+//! # Ok(())
+//! # }
+//! # }
+//! ```
+//!
+//! ## Embassy Usage (Embedded)
+//!
+//! Illustrative (not compiled: requires the `embassy-runtime` feature and a
+//! device network stack):
+//!
+//! ```rust,ignore
+//! use aimdb_core::AimDbBuilder;
+//! use aimdb_embassy_adapter::EmbassyAdapter;
+//! use aimdb_knx_connector::KnxConnector;
+//! use alloc::sync::Arc;
+//!
+//! let runtime = Arc::new(EmbassyAdapter::new());
+//!
+//! let sensor = aimdb_core::Name::<SensorData>::new("sensor.data");
+//! let db = AimDbBuilder::new()
+//!     .runtime(runtime)
+//!     .with_connector(KnxConnector::new(binder, EmbassyDelay, gateway))
+//!     .configure(sensor, |reg| {
+//!         reg.buffer_sized::<16, 2>(EmbassyBufferType::SpmcRing)
+//!            .source(sensor_producer)
+//!            // Inbound: Monitor KNX bus
+//!            .link_from("knx://1/0/10")
+//!            .with_deserializer(|_ctx, data| SensorData::from_knx(data).map_err(Into::into))
+//!            .finish()
+//!            // Outbound: Send to KNX
+//!            .link_to("knx://1/0/11")
+//!            .with_serializer(|_ctx, data| data.to_knx_bytes())
+//!            .finish();
+//!     })
+//!     .build().await?;
+//! ```
+//!
+//! ## Group Address Format
+//!
+//! Group addresses use 3-level notation: `main/middle/sub`
+//! - Main: 0-31 (5 bits)
+//! - Middle: 0-7 (3 bits)
+//! - Sub: 0-255 (8 bits)
+//!
+//! Example: `knx://192.168.1.19:3671/1/0/7`
+//!
+//! ## DPT Support
+//!
+//! This connector uses `knx-pico` for Data Point Type conversion:
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+// The shared tunnel engine uses `alloc` types on both runtimes.
+extern crate alloc;
+
+#[cfg(feature = "connector")]
+mod events;
+
+// Re-export knx-pico types for user convenience
+pub use knx_pico::GroupAddress;
+
+// Re-export DPT module for encoding/decoding KNX data types
+/// KNX Datapoint Types (DPT) for encoding and decoding telegrams
+///
+/// ```rust
+/// use aimdb_knx_connector::dpt::{Dpt1, Dpt9, DptEncode, DptDecode};
+///
+/// let mut buf = [0u8; 4];
+///
+/// // Boolean (DPT 1.001)
+/// let len = Dpt1::Switch.encode(true, &mut buf)?;
+///
+/// // Temperature (DPT 9.001)
+/// let len = Dpt9::Temperature.encode(21.5, &mut buf)?;
+/// let temp = Dpt9::Temperature.decode(&buf[..len])?;
+/// # Ok::<(), knx_pico::error::KnxError>(())
+/// ```
+pub mod dpt {
+    pub use knx_pico::dpt::*;
+}
+
+// Convenience re-exports for common types (std only for backward compat)
+#[cfg(feature = "std")]
+pub use knx_pico::dpt::{Dpt1, Dpt5, Dpt9, DptDecode, DptEncode};
+
+// Runtime-neutral KNX/IP tunneling state machine shared by both transports.
+pub mod tunnel;
+
+// The connection task: one body for every runtime, generic over core's
+// datagram and delay traits.
+#[cfg(feature = "connector")]
+pub mod client;
+
+// Runtime-neutral `KnxConnector` over an adapter's datagram transport.
+#[cfg(feature = "connector")]
+pub mod connector;
+
+#[cfg(feature = "connector")]
+pub use connector::KnxConnector;

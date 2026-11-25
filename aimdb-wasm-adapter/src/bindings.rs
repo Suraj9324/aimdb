@@ -1,0 +1,681 @@
+//! `#[wasm_bindgen]` TypeScript-facing API
+//!
+//! Exposes a high-level facade to JavaScript/TypeScript. Users do not interact
+//! with `Arc`, `RecordRegistrar`, or feature flags — all of that is hidden
+//! behind `WasmDb`, `configureRecord`, `get`, `set`, and `subscribe`.
+//!
+//! # Two-Phase Lifecycle
+//!
+//! 1. **Configuration** — `new WasmDb()` + `configureRecord(…)` calls collect
+//!    record definitions without building the database.
+//! 2. **Build** — `await db.build()` compiles the configuration into a live
+//!    AimDB instance (buffers, records, typed storage).
+//! 3. **Operation** — `get` / `set` / `subscribe` interact with the live
+//!    database. Contract enforcement (Rust serde) happens at the WASM boundary.
+
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::rc::Rc;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::cell::RefCell;
+use core::fmt::Debug;
+
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use wasm_bindgen::prelude::*;
+
+use aimdb_core::buffer::BufferCfg;
+use aimdb_core::builder::{AimDb, AimDbBuilder};
+use aimdb_core::record_id::StringKey;
+use aimdb_core::session::aimx::AimxCodec;
+use aimdb_core::{EnvelopeCodec, Inbound, Outbound, Payload};
+
+use crate::schema_registry::{SchemaOps, SchemaRegistry};
+use crate::ws_bridge::WsBridge;
+use crate::WasmAdapter;
+
+// ─── Option parsing ───────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordOptions {
+    schema_type: String,
+    buffer: BufferOption,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BufferOption {
+    /// Simple string: `"SingleLatest"`, `"Mailbox"`, `"SpmcRing"`
+    Simple(String),
+    /// Object: `{ type: "SpmcRing", capacity: 200 }`
+    Config {
+        r#type: String,
+        capacity: Option<usize>,
+    },
+}
+
+fn parse_buffer_cfg(opt: &BufferOption) -> Result<BufferCfg, JsError> {
+    match opt {
+        BufferOption::Simple(s) => match s.as_str() {
+            "SingleLatest" => Ok(BufferCfg::SingleLatest),
+            "Mailbox" => Ok(BufferCfg::Mailbox),
+            "SpmcRing" => Ok(BufferCfg::SpmcRing { capacity: 1024 }),
+            _ => Err(JsError::new(&format!("Unknown buffer type: {s}"))),
+        },
+        BufferOption::Config { r#type, capacity } => match r#type.as_str() {
+            "SpmcRing" => Ok(BufferCfg::SpmcRing {
+                capacity: capacity.unwrap_or(1024),
+            }),
+            "SingleLatest" => Ok(BufferCfg::SingleLatest),
+            "Mailbox" => Ok(BufferCfg::Mailbox),
+            _ => Err(JsError::new(&format!("Unknown buffer type: {}", r#type))),
+        },
+    }
+}
+
+fn is_known_schema(registry: &SchemaRegistry, name: &str) -> bool {
+    registry.is_known(name)
+}
+
+// ─── Collected config (pre-build) ─────────────────────────────────────────
+
+struct RecordConfig {
+    key: String,
+    schema_type: String,
+    buffer_cfg: BufferCfg,
+}
+
+// ─── WasmDb ───────────────────────────────────────────────────────────────
+
+/// AimDB instance compiled to WebAssembly.
+///
+/// # Example (TypeScript)
+/// ```ts
+/// const db = new WasmDb();
+/// db.configureRecord('sensors.temperature.vienna', {
+///   schemaType: 'temperature',
+///   buffer: 'SingleLatest',
+/// });
+/// await db.build();
+/// db.set('sensors.temperature.vienna', { celsius: 22.5, timestamp: Date.now() });
+/// const t = db.get('sensors.temperature.vienna'); // validated by Rust serde
+/// // t = { value: { celsius: 22.5, ... }, ts: 1234567n }
+/// ```
+#[wasm_bindgen]
+pub struct WasmDb {
+    /// Pre-build record configurations. `None` after `build()`.
+    configs: Option<Vec<RecordConfig>>,
+    /// Live database handle. `None` before `build()`.
+    db: Option<AimDb>,
+    /// Maps record key → schema type name (always populated).
+    schema_map: BTreeMap<String, String>,
+    /// Type-erased dispatch registry built via `.register::<T>()` calls.
+    registry: SchemaRegistry,
+}
+
+impl Default for WasmDb {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[wasm_bindgen]
+impl WasmDb {
+    /// Create a new (unconfigured) AimDB WASM instance.
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> WasmDb {
+        WasmDb {
+            configs: Some(Vec::new()),
+            db: None,
+            schema_map: BTreeMap::new(),
+            registry: SchemaRegistry::new(),
+        }
+    }
+
+    /// Register a record before building the database.
+    ///
+    /// `options` is a JS object:
+    /// ```json
+    /// {
+    ///   "schemaType": "temperature",
+    ///   "buffer": "SingleLatest"  // or { "type": "SpmcRing", "capacity": 100 }
+    /// }
+    /// ```
+    #[wasm_bindgen(js_name = "configureRecord")]
+    pub fn configure_record(&mut self, record_key: &str, options: JsValue) -> Result<(), JsError> {
+        let configs = self
+            .configs
+            .as_mut()
+            .ok_or_else(|| JsError::new("Cannot configure records after build()"))?;
+
+        let opts: RecordOptions = serde_wasm_bindgen::from_value(options)
+            .map_err(|e| JsError::new(&format!("Invalid options: {e}")))?;
+
+        if !is_known_schema(&self.registry, &opts.schema_type) {
+            return Err(JsError::new(&format!(
+                "Unknown schema type: {}",
+                opts.schema_type
+            )));
+        }
+
+        let buffer_cfg = parse_buffer_cfg(&opts.buffer)?;
+
+        self.schema_map
+            .insert(record_key.to_string(), opts.schema_type.clone());
+
+        configs.push(RecordConfig {
+            key: record_key.to_string(),
+            schema_type: opts.schema_type,
+            buffer_cfg,
+        });
+
+        Ok(())
+    }
+
+    /// Build the database from the collected configuration.
+    ///
+    /// Must be called exactly once, after all `configureRecord()` calls and
+    /// before any `get` / `set` / `subscribe`.
+    pub async fn build(&mut self) -> Result<(), JsError> {
+        let configs = self
+            .configs
+            .take()
+            .ok_or_else(|| JsError::new("Database already built"))?;
+
+        let rt = Arc::new(WasmAdapter);
+        let mut builder = AimDbBuilder::new().runtime(rt);
+
+        for config in &configs {
+            apply_record_config(&self.registry, &mut builder, config)?;
+        }
+
+        let (db, runner) = builder
+            .build()
+            .await
+            .map_err(|e| JsError::new(&format!("Build failed: {e:?}")))?;
+
+        // Drive the runner on the JS microtask queue. The runner future is
+        // !Send (it owns wasm-only state), but `wasm_bindgen_futures::spawn_local`
+        // doesn't require Send — WASM is single-threaded.
+        wasm_bindgen_futures::spawn_local(async move {
+            runner.run().await;
+        });
+
+        self.db = Some(db);
+        Ok(())
+    }
+
+    /// Get the current value of a record as `{ value, ts }`, or `undefined`.
+    ///
+    /// The value is the latest snapshot — it does not wait for a new push.
+    /// `ts` is its write stamp in nanoseconds on the instance clock, as a
+    /// `BigInt`. Returns `undefined` if no value has been produced yet.
+    pub fn get(&self, record_key: &str) -> Result<JsValue, JsError> {
+        let (db, ops) = self.resolve(record_key)?;
+        (ops.get)(db, record_key)
+    }
+
+    /// Set a record value (validates via Rust serde deserialization).
+    ///
+    /// Throws `JsError` if the payload fails contract validation (e.g. missing
+    /// required fields) or the record key is unknown.
+    pub fn set(&mut self, record_key: &str, value: JsValue) -> Result<(), JsError> {
+        let (db, ops) = self.resolve(record_key)?;
+        (ops.set)(db, record_key, value)
+    }
+
+    /// Subscribe to record updates. Returns an unsubscribe function.
+    ///
+    /// `callback` is invoked on every buffer push with `{ value, ts }`, as
+    /// [`get`](Self::get) returns it.
+    pub fn subscribe(
+        &self,
+        record_key: &str,
+        callback: &js_sys::Function,
+    ) -> Result<JsValue, JsError> {
+        let (db, ops) = self.resolve(record_key)?;
+        (ops.subscribe)(db, record_key, callback)
+    }
+
+    /// Returns `true` if the database has been built.
+    #[wasm_bindgen(js_name = "isBuilt")]
+    pub fn is_built(&self) -> bool {
+        self.db.is_some()
+    }
+
+    /// Discover topics served at `url` without building a full database.
+    ///
+    /// Opens a one-shot WebSocket, sends an AimX `record.list` request, and
+    /// resolves with one `RecordMetadata` object per record once the server
+    /// responds. Rejects after 30 s if no response arrives, or immediately on
+    /// connection error.
+    ///
+    /// The topic is `record_key`; `name` is the Rust type name, not the topic.
+    ///
+    /// A row means *registered*, not *live*: a server registering a fixed pool
+    /// lists the whole pool. `produced_count` tells them apart, and is present
+    /// only if the server was built with `observability`.
+    ///
+    /// # Example (TypeScript)
+    /// ```ts
+    /// const wasm = await import("@aimdb/aimdb-wasm-adapter");
+    /// await wasm.default();
+    /// const rows = await wasm.WasmDb.discover("wss://api.example.com/ws");
+    /// rows.forEach(r => db.configureRecord(r.record_key, { schemaType: r.schema_type, buffer: "SingleLatest" }));
+    /// ```
+    pub async fn discover(url: &str) -> Result<JsValue, JsError> {
+        wasm_bindgen_futures::JsFuture::from(discover_impl(url.to_string()))
+            .await
+            .map_err(|e| JsError::new(&format!("discover: {e:?}")))
+    }
+
+    /// Returns the list of schema type names known to this WASM adapter.
+    ///
+    /// Use this to filter discovered rows before calling `configureRecord` —
+    /// records whose `schema_type` is not in this list cannot be handled by the
+    /// WASM runtime and should be skipped.
+    #[wasm_bindgen(js_name = "knownSchemas")]
+    pub fn known_schemas(&self) -> Vec<String> {
+        self.registry
+            .known_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Connect a WebSocket bridge to this database for server synchronization.
+    ///
+    /// The database remains usable for local `get()` / `set()` / `subscribe()`
+    /// after the bridge is opened — the bridge gets a cheap clone of the
+    /// internal `AimDb` handle (two `Arc` pointer copies).
+    ///
+    /// # Example (TypeScript)
+    /// ```ts
+    /// const bridge = db.connectBridge('wss://api.example.com/ws', {
+    ///   subscribeTopics: ['sensors.#'],
+    ///   autoReconnect: true,
+    /// });
+    /// bridge.onStatusChange((status) => console.log(status));
+    /// ```
+    #[wasm_bindgen(js_name = "connectBridge")]
+    pub fn connect_bridge(&self, url: &str, options: JsValue) -> Result<WsBridge, JsError> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| JsError::new("Database not built. Call build() first."))?
+            .clone(); // cheap: two Arc pointer copies
+
+        let schema_map = self.schema_map.clone();
+        let registry = self.registry.clone();
+
+        WsBridge::new_internal(db, schema_map, registry, url, options)
+    }
+}
+
+// ─── Rust-only API (not exported to JS) ───────────────────────────────────
+
+use aimdb_data_contracts::Streamable;
+
+impl WasmDb {
+    /// Register a [`Streamable`] type for runtime dispatch.
+    ///
+    /// Must be called **before** [`build`](WasmDb::build) for the type to be
+    /// available via `configureRecord`, `get`, `set`, and `subscribe`.
+    ///
+    /// This method is Rust-only (not exported via `#[wasm_bindgen]`) because
+    /// generic type parameters cannot cross the WASM boundary. Typical usage
+    /// is in a factory function that builds a pre-configured `WasmDb`:
+    ///
+    /// Illustrative (not compiled: `#[wasm_bindgen]` exports only build for
+    /// the wasm32 target):
+    ///
+    /// ```rust,ignore
+    /// #[wasm_bindgen]
+    /// pub fn create_db() -> WasmDb {
+    ///     let mut db = WasmDb::new();
+    ///     db.register::<Temperature>();
+    ///     db.register::<Humidity>();
+    ///     db
+    /// }
+    /// ```
+    pub fn register<T: Streamable>(&mut self) -> &mut Self {
+        self.registry.register::<T>();
+        self
+    }
+}
+
+// ─── discover_impl ────────────────────────────────────────────────────────
+
+/// Build a one-shot WebSocket promise that resolves with the `record.list` rows.
+///
+/// Speaks one AimX exchange via the shared [`AimxCodec`]: a `record.list`
+/// request (`id` 1) whose reply carries the record-metadata rows, forwarded to
+/// JS unchanged.
+///
+/// Each callback pair (resolve, reject) is stored in an `Rc<RefCell<Option>>`
+/// so that whichever event fires first wins and subsequent events are no-ops.
+fn discover_impl(url: String) -> js_sys::Promise {
+    js_sys::Promise::new(&mut move |resolve, reject| {
+        // Declare our AimX version in the URL — the server gates the WS upgrade
+        // on it, and a browser cannot set handshake headers (`?v=4.0`).
+        let url = aimdb_core::remote::ws_url_with_version(&url);
+        let ws = match web_sys::WebSocket::new(&url) {
+            Ok(ws) => ws,
+            Err(e) => {
+                let _ = reject.call1(
+                    &JsValue::NULL,
+                    &JsValue::from_str(&format!("WebSocket open failed: {e:?}")),
+                );
+                return;
+            }
+        };
+        let ws = Rc::new(ws);
+        let resolve_rc: Rc<RefCell<Option<js_sys::Function>>> =
+            Rc::new(RefCell::new(Some(resolve)));
+        let reject_rc: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(Some(reject)));
+
+        // Encode the request frame once via the shared codec.
+        let request = {
+            let mut buf = Vec::new();
+            if AimxCodec
+                .encode_inbound(
+                    Inbound::Request {
+                        id: 1,
+                        method: "record.list".into(),
+                        params: Payload::from(&b"null"[..]),
+                    },
+                    &mut buf,
+                )
+                .is_err()
+            {
+                if let Some(rej) = reject_rc.borrow_mut().take() {
+                    let _ = rej.call1(
+                        &JsValue::NULL,
+                        &JsValue::from_str("failed to encode record.list request"),
+                    );
+                }
+                return;
+            }
+            String::from_utf8(buf).unwrap_or_default()
+        };
+
+        // on_open: send the record.list request
+        {
+            let ws_clone = ws.clone();
+            let on_open = Closure::wrap(Box::new(move || {
+                let _ = ws_clone.send_with_str(&request);
+            }) as Box<dyn FnMut()>);
+            ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+            on_open.forget();
+        }
+
+        // on_message: parse the reply, resolve, close socket
+        {
+            let ws_clone = ws.clone();
+            let resolve_clone = resolve_rc.clone();
+            let reject_clone = reject_rc.clone();
+            let on_message = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
+                let Some(text) = event.data().as_string() else {
+                    let _ = ws_clone.close();
+                    if let Some(rej) = reject_clone.borrow_mut().take() {
+                        let _ = rej.call1(
+                            &JsValue::NULL,
+                            &JsValue::from_str("Non-text frame from server"),
+                        );
+                    }
+                    return;
+                };
+                // Decode via the shared codec; ignore anything that isn't our
+                // `record.list` reply (auto-subscribe events, acks, other ids,
+                // non-JSON noise) — the timeout guards a dead peer.
+                let result = match AimxCodec.decode_outbound(text.as_bytes()) {
+                    Ok(Outbound::Reply { id: 1, result }) => result,
+                    _ => return,
+                };
+                let _ = ws_clone.close();
+                let topics = result
+                    .ok()
+                    .and_then(|ok| serde_json::from_slice::<Vec<serde_json::Value>>(&ok).ok());
+                match topics {
+                    Some(topics) => {
+                        let serializer = serde_wasm_bindgen::Serializer::json_compatible();
+                        let arr = js_sys::Array::new();
+                        for topic in &topics {
+                            if let Ok(js_val) = topic.serialize(&serializer) {
+                                arr.push(&js_val);
+                            }
+                        }
+                        if let Some(res) = resolve_clone.borrow_mut().take() {
+                            let _ = res.call1(&JsValue::NULL, &arr);
+                        }
+                    }
+                    None => {
+                        if let Some(rej) = reject_clone.borrow_mut().take() {
+                            let _ = rej.call1(
+                                &JsValue::NULL,
+                                &JsValue::from_str("record.list failed on server"),
+                            );
+                        }
+                    }
+                }
+            }) as Box<dyn FnMut(web_sys::MessageEvent)>);
+            ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+            on_message.forget();
+        }
+
+        // on_error: reject
+        {
+            let reject_clone = reject_rc.clone();
+            let on_error = Closure::wrap(Box::new(move || {
+                if let Some(rej) = reject_clone.borrow_mut().take() {
+                    let _ = rej.call1(
+                        &JsValue::NULL,
+                        &JsValue::from_str("WebSocket error during discover"),
+                    );
+                }
+            }) as Box<dyn FnMut()>);
+            ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+            on_error.forget();
+        }
+
+        // on_close: reject if server closed before the record.list reply
+        // (no-op if on_message already resolved)
+        {
+            let reject_clone = reject_rc.clone();
+            let on_close = Closure::wrap(Box::new(move || {
+                if let Some(rej) = reject_clone.borrow_mut().take() {
+                    let _ = rej.call1(
+                        &JsValue::NULL,
+                        &JsValue::from_str("Connection closed before record.list reply"),
+                    );
+                }
+            }) as Box<dyn FnMut()>);
+            ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+            on_close.forget();
+        }
+
+        // Timeout: reject after 30 s
+        {
+            let reject_clone = reject_rc.clone();
+            let timeout_cb = Closure::once(move || {
+                if let Some(rej) = reject_clone.borrow_mut().take() {
+                    let _ = rej.call1(&JsValue::NULL, &JsValue::from_str("discover timed out"));
+                }
+            });
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                    timeout_cb.as_ref().unchecked_ref(),
+                    30_000,
+                );
+            }
+            timeout_cb.forget();
+        }
+    })
+}
+
+// ─── Private helpers ──────────────────────────────────────────────────────
+
+impl WasmDb {
+    /// Resolve a record key to the live DB handle and its type-erased ops.
+    fn resolve(&self, record_key: &str) -> Result<(&AimDb, &SchemaOps), JsError> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| JsError::new("Database not built. Call build() first."))?;
+
+        let schema = self
+            .schema_map
+            .get(record_key)
+            .map(|v| v.as_str())
+            .ok_or_else(|| JsError::new(&format!("Unknown record key: {record_key}")))?;
+
+        let ops = self
+            .registry
+            .get(schema)
+            .ok_or_else(|| JsError::new(&format!("Unknown schema type: {schema}")))?;
+
+        Ok((db, ops))
+    }
+}
+
+// ─── Typed dispatch ───────────────────────────────────────────────────────
+
+/// Apply a single `RecordConfig` to the builder, dispatching on schema type.
+fn apply_record_config(
+    registry: &SchemaRegistry,
+    builder: &mut AimDbBuilder,
+    config: &RecordConfig,
+) -> Result<(), JsError> {
+    let key = StringKey::intern(config.key.clone());
+    let cfg = config.buffer_cfg.clone();
+
+    let ops = registry
+        .get(&config.schema_type)
+        .ok_or_else(|| JsError::new(&format!("Unknown schema type: {}", config.schema_type)))?;
+
+    (ops.configure)(builder, key, cfg);
+    Ok(())
+}
+
+/// Read the latest snapshot for record `key` and convert to `JsValue`.
+pub(crate) fn get_typed<T>(db: &AimDb, key: &str) -> Result<JsValue, JsError>
+where
+    T: Send + Sync + 'static + Debug + Clone + Serialize,
+{
+    let name = aimdb_core::Name::<T>::new(key);
+
+    match db
+        .latest(name)
+        .map_err(|e| JsError::new(&format!("{e:?}")))?
+    {
+        Some(val) => stamped_to_js(&val.value, val.stamp())
+            .map_err(|e| JsError::new(&format!("Serialization failed: {e}"))),
+        None => Ok(JsValue::UNDEFINED),
+    }
+}
+
+/// A read result for JavaScript: `{ value, ts }`, the value JSON-compatible
+/// and `ts` its write stamp in nanoseconds on the instance clock.
+///
+/// `ts` is a `BigInt`: stamps pass 2⁵³ after ~104 days of uptime, where a JS
+/// number would lose precision (design 058 §5.1).
+fn stamped_to_js<T: Serialize>(
+    value: &T,
+    stamp: aimdb_core::Stamp,
+) -> Result<JsValue, serde_wasm_bindgen::Error> {
+    let serializer = serde_wasm_bindgen::Serializer::json_compatible();
+    let out = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&out, &"value".into(), &value.serialize(&serializer)?);
+    let _ = js_sys::Reflect::set(
+        &out,
+        &"ts".into(),
+        &js_sys::BigInt::from(stamp.as_nanos()).into(),
+    );
+    Ok(out.into())
+}
+
+/// Deserialize `JsValue` → `T` (contract enforcement), then push to buffer.
+pub(crate) fn set_typed<T>(db: &AimDb, key: &str, value: JsValue) -> Result<(), JsError>
+where
+    T: Send + Sync + 'static + Debug + Clone + DeserializeOwned,
+{
+    let val: T = serde_wasm_bindgen::from_value(value)
+        .map_err(|e| JsError::new(&format!("Contract violation: {e}")))?;
+
+    // Single write path via Producer<T>.
+    let record_key_1 = aimdb_core::Name::<T>::new(key);
+    db.producer(record_key_1)
+        .map_err(|e| JsError::new(&format!("{e:?}")))?
+        .produce(val);
+    Ok(())
+}
+
+/// Subscribe to a record's buffer and invoke `callback` on each new value.
+/// Returns a JS function that cancels the subscription when called.
+///
+/// Uses `futures_util::future::select` to race `recv()` against a cancel
+/// future so the unsubscribe closure can break the loop immediately — even
+/// when `recv()` is blocked waiting for the next push.
+pub(crate) fn subscribe_typed<T>(
+    db: &AimDb,
+    key: &str,
+    callback: &js_sys::Function,
+) -> Result<JsValue, JsError>
+where
+    T: Send + Sync + 'static + Debug + Clone + Serialize,
+{
+    let record_key_2 = aimdb_core::Name::<T>::new(key);
+    let mut reader = db
+        .subscribe(record_key_2)
+        .map_err(|e| JsError::new(&format!("{e:?}")))?;
+
+    let callback = callback.clone();
+    let (cancel_token, cancel_handle) = crate::buffer::cancel_pair();
+
+    wasm_bindgen_futures::spawn_local(async move {
+        use core::task::Poll;
+        use futures_util::future::{select, Either};
+
+        loop {
+            // Future that resolves when cancel() is called.
+            let cancel_fut = core::future::poll_fn(|cx| {
+                if cancel_token.is_cancelled() {
+                    Poll::Ready(())
+                } else {
+                    cancel_token.register_waker(cx.waker());
+                    Poll::Pending
+                }
+            });
+
+            let recv_fut = reader.recv();
+
+            futures_util::pin_mut!(cancel_fut);
+            futures_util::pin_mut!(recv_fut);
+
+            match select(recv_fut, cancel_fut).await {
+                Either::Left((Ok(val), _)) => {
+                    if let Ok(js) = stamped_to_js(&val.value, val.stamp()) {
+                        let _ = callback.call1(&JsValue::NULL, &js);
+                    }
+                }
+                Either::Left((Err(_), _)) => break, // buffer error
+                Either::Right(((), _)) => break,    // cancelled
+            }
+        }
+    });
+
+    // Closure::wrap (not once_into_js) so it can be called multiple times
+    // (React StrictMode calls cleanup twice).
+    let unsub = Closure::wrap(Box::new(move || {
+        cancel_handle.cancel();
+    }) as Box<dyn FnMut()>);
+    Ok(unsub.into_js_value())
+}
+
+// ─── Sync future polling ──────────────────────────────────────────────────

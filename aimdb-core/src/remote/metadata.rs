@@ -1,0 +1,365 @@
+//! Record metadata types for remote introspection (feature `remote`).
+//!
+//! [`RecordMetadata`] describes a registered record's runtime state — buffer
+//! configuration, producer/consumer counts, the `writable` flag, and
+//! (feature-gated) buffer metrics / stage profiling — for the AimX `record.list`
+//! response. Computed on demand from a record's static structure; core keeps no
+//! per-record metadata state.
+
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::any::TypeId;
+use serde::{Deserialize, Serialize};
+
+use crate::graph::RecordOrigin;
+use crate::record_id::{RecordId, RecordKey};
+
+/// Metadata about a registered record type
+///
+/// Provides information for remote introspection, including buffer
+/// configuration and producer/consumer counts.
+///
+/// When the `observability` feature is enabled, additional fields are included
+/// for buffer-level statistics (produced_count, consumed_count, etc.).
+///
+/// # Liveness is an observability extra
+///
+/// A `record.list` reply enumerates records the server **registered**, not
+/// records that have carried a value — a server registering a fixed pool up
+/// front lists the whole pool. Only `produced_count` distinguishes them, and
+/// it is `observability`-gated by design (liveness
+/// derives from buffer counters, which constrained targets compile away). So a
+/// server whose clients need that distinction must be built with
+/// `observability` on; without it the honest client answer is "unknown".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RecordMetadata {
+    /// Unique record identifier (index in the storage)
+    pub record_id: u32,
+
+    /// Unique record key (stable identifier for lookup)
+    pub record_key: String,
+
+    /// Record type name (Rust type name)
+    pub name: String,
+
+    /// TypeId as hexadecimal string
+    pub type_id: String,
+
+    /// How the record gets its values (Source, Link, Transform, Passive)
+    pub origin: RecordOrigin,
+
+    /// Buffer type: "spmc_ring", "single_latest", "mailbox", or "none"
+    pub buffer_type: String,
+
+    /// Buffer capacity (None for unbounded or no buffer)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_capacity: Option<usize>,
+
+    /// Number of registered producer services
+    pub producer_count: usize,
+
+    /// Number of registered consumer services
+    pub consumer_count: usize,
+
+    /// Whether write operations are permitted for this record
+    pub writable: bool,
+
+    /// Number of outbound connector links registered
+    pub outbound_connector_count: usize,
+
+    /// Data-contract schema name (e.g. `"temperature"`). Set from the schema
+    /// the record was configured with (`RecordRegistrar::schema`, filled by
+    /// `aimdb-data-contracts` from `SchemaType`); otherwise a serving dispatch
+    /// that owns a schema registry may fill it (the WebSocket connector's
+    /// `StreamableRegistry`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_type: Option<String>,
+
+    /// Version of the schema named by `schema_type`, when the record was
+    /// configured with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
+
+    /// The record key's **leaf segment** — everything after the last `.` or `/`
+    /// (`"vienna"` for `"temp.vienna"` or `"sensors/temp/vienna"`).
+    ///
+    /// Only an entity identifier where the leaf *is* the node. Under a deeper
+    /// scheme it is not: `"station.17.temperature"` yields `"temperature"`, not
+    /// the `"17"` a caller wants — such clients must parse the key themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity: Option<String>,
+
+    /// The record's key table, when it has keyed inbound links.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_keys: Option<InboundKeysInfo>,
+
+    /// Per-link ingress counters, available through record.list / record.get.
+    #[cfg(feature = "observability")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbound_routes: Vec<crate::InboundRouteMetrics>,
+
+    // ===== Buffer metrics (feature-gated) =====
+    /// Total items pushed to the buffer (metrics feature only).
+    ///
+    /// Doubles as the liveness signal: `> 0` has carried a value, `0` is an
+    /// untouched registration, absent is unknowable (see the type-level note).
+    #[cfg(feature = "observability")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub produced_count: Option<u64>,
+
+    /// Total items consumed from the buffer (metrics feature only)
+    #[cfg(feature = "observability")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumed_count: Option<u64>,
+
+    /// Total items dropped due to overflow/lag (metrics feature only)
+    #[cfg(feature = "observability")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dropped_count: Option<u64>,
+
+    /// Current buffer occupancy: (items, capacity) (metrics feature only)
+    #[cfg(feature = "observability")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occupancy: Option<(usize, usize)>,
+
+    // ===== Stage profiling (feature-gated) =====
+    /// Per-stage timing metrics (`.source()`/`.tap()`/`.link()`), if the
+    /// `observability` feature is enabled and any stage has been registered.
+    #[cfg(feature = "observability")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_profiling: Option<Vec<crate::profiling::StageProfilingInfo>>,
+
+    // ===== Signal gauges (feature-gated) =====
+    /// Per-record domain-signal statistics (last/min/max/mean) fed by
+    /// `Observable::observe()`, if the `observability` feature is enabled and any
+    /// gauge has been registered.
+    #[cfg(feature = "observability")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal_stats: Option<Vec<crate::profiling::SignalStatsInfo>>,
+}
+
+/// A record's key table. Key names are not listed; `inbound_key_name`
+/// resolves one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct InboundKeysInfo {
+    /// The keyed capture of each keyed link.
+    pub captures: Vec<String>,
+    pub capacity: u16,
+    pub assigned: usize,
+    /// Messages turned away because the table was full, once per matching
+    /// keyed link.
+    pub dropped: u32,
+}
+
+impl RecordMetadata {
+    /// Creates a new record metadata entry
+    ///
+    /// # Arguments
+    /// * `record_id` - The RecordId index
+    /// * `record_key` - The unique record key
+    /// * `type_id` - The TypeId of the record
+    /// * `name` - The Rust type name
+    /// * `origin` - How the record gets its values (Source, Link, Transform, Passive)
+    /// * `buffer_type` - Buffer type string
+    /// * `buffer_capacity` - Optional buffer capacity
+    /// * `producer_count` - Number of producers
+    /// * `consumer_count` - Number of consumers
+    /// * `writable` - Whether writes are permitted
+    /// * `outbound_connector_count` - Number of outbound connectors
+    #[allow(clippy::too_many_arguments)]
+    pub fn new<K: RecordKey>(
+        record_id: RecordId,
+        record_key: K,
+        type_id: TypeId,
+        name: String,
+        origin: RecordOrigin,
+        buffer_type: String,
+        buffer_capacity: Option<usize>,
+        producer_count: usize,
+        consumer_count: usize,
+        writable: bool,
+        outbound_connector_count: usize,
+    ) -> Self {
+        let entity = Some(super::topic_leaf(record_key.as_str()).to_string());
+        Self {
+            record_id: record_id.raw(),
+            record_key: record_key.as_str().to_string(),
+            name,
+            type_id: format!("{:?}", type_id),
+            origin,
+            buffer_type,
+            buffer_capacity,
+            producer_count,
+            consumer_count,
+            writable,
+            outbound_connector_count,
+            schema_type: None,
+            schema_version: None,
+            entity,
+            inbound_keys: None,
+            #[cfg(feature = "observability")]
+            inbound_routes: Vec::new(),
+            #[cfg(feature = "observability")]
+            produced_count: None,
+            #[cfg(feature = "observability")]
+            consumed_count: None,
+            #[cfg(feature = "observability")]
+            dropped_count: None,
+            #[cfg(feature = "observability")]
+            occupancy: None,
+            #[cfg(feature = "observability")]
+            stage_profiling: None,
+            #[cfg(feature = "observability")]
+            signal_stats: None,
+        }
+    }
+
+    /// Sets `schema_type` and `schema_version` from the record's schema, if
+    /// it has one.
+    pub fn with_schema(mut self, schema: Option<&crate::graph::SchemaInfo>) -> Self {
+        if let Some(schema) = schema {
+            self.schema_type = Some(schema.name.clone());
+            self.schema_version = Some(schema.version);
+        }
+        self
+    }
+
+    /// Sets buffer metrics from a snapshot (metrics feature only)
+    ///
+    /// Populates produced_count, consumed_count, dropped_count, and occupancy
+    /// from the provided metrics snapshot.
+    #[cfg(feature = "observability")]
+    pub fn with_buffer_metrics(mut self, snapshot: crate::buffer::BufferMetricsSnapshot) -> Self {
+        self.produced_count = Some(snapshot.produced_count);
+        self.consumed_count = Some(snapshot.consumed_count);
+        self.dropped_count = Some(snapshot.dropped_count);
+        // Only include occupancy if it's meaningful (non-zero capacity)
+        if snapshot.occupancy.1 > 0 {
+            self.occupancy = Some(snapshot.occupancy);
+        }
+        self
+    }
+
+    /// Attaches a stage profiling snapshot (profiling feature only).
+    #[cfg(feature = "observability")]
+    pub fn with_stage_profiling(
+        mut self,
+        stages: Vec<crate::profiling::StageProfilingInfo>,
+    ) -> Self {
+        if !stages.is_empty() {
+            self.stage_profiling = Some(stages);
+        }
+        self
+    }
+
+    /// Attaches a signal-gauge snapshot (observability feature only).
+    #[cfg(feature = "observability")]
+    pub fn with_signal_stats(mut self, signals: Vec<crate::profiling::SignalStatsInfo>) -> Self {
+        if !signals.is_empty() {
+            self.signal_stats = Some(signals);
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record_id::StringKey;
+
+    #[test]
+    fn test_record_metadata_creation() {
+        let key_test_record_1 = StringKey::new("test.record");
+        let type_id = TypeId::of::<i32>();
+        let metadata = RecordMetadata::new(
+            RecordId::new(0),
+            key_test_record_1,
+            type_id,
+            "i32".to_string(),
+            RecordOrigin::Source,
+            "spmc_ring".to_string(),
+            Some(100),
+            1,
+            2,
+            false,
+            0,
+        );
+
+        assert_eq!(metadata.record_id, 0);
+        assert_eq!(metadata.record_key, "test.record");
+        assert_eq!(metadata.name, "i32");
+        assert!(matches!(metadata.origin, RecordOrigin::Source));
+        assert_eq!(metadata.buffer_type, "spmc_ring");
+        assert_eq!(metadata.buffer_capacity, Some(100));
+        assert_eq!(metadata.producer_count, 1);
+        assert_eq!(metadata.consumer_count, 2);
+        assert_eq!(metadata.outbound_connector_count, 0);
+        assert!(!metadata.writable);
+    }
+
+    #[test]
+    fn test_record_metadata_serialization() {
+        let key_app_config_2 = StringKey::new("app.config");
+        let type_id = TypeId::of::<String>();
+        let metadata = RecordMetadata::new(
+            RecordId::new(1),
+            key_app_config_2,
+            type_id,
+            "String".to_string(),
+            RecordOrigin::Passive,
+            "single_latest".to_string(),
+            None,
+            1,
+            1,
+            true,
+            2,
+        );
+
+        let json = serde_json::to_string(&metadata).unwrap();
+        assert!(json.contains("\"record_id\":1"));
+        assert!(json.contains("\"record_key\":\"app.config\""));
+        assert!(json.contains("\"name\":\"String\""));
+        assert!(json.contains("\"origin\":\"passive\""));
+        assert!(json.contains("\"buffer_type\":\"single_latest\""));
+        assert!(json.contains("\"writable\":true"));
+        assert!(json.contains("\"outbound_connector_count\":2"));
+        assert!(!json.contains("inbound_keys"));
+    }
+
+    #[test]
+    fn inbound_keys_are_optional_on_the_wire() {
+        let key_sensors_readings_3 = StringKey::new("sensors.readings");
+        let mut metadata = RecordMetadata::new(
+            RecordId::new(0),
+            key_sensors_readings_3,
+            TypeId::of::<i32>(),
+            "i32".to_string(),
+            RecordOrigin::Passive,
+            "spmc_ring".to_string(),
+            Some(256),
+            0,
+            0,
+            false,
+            0,
+        );
+
+        // An older server's reply has no `inbound_keys`.
+        let json = serde_json::to_string(&metadata).unwrap();
+        let old: RecordMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.inbound_keys, None);
+
+        let keys = InboundKeysInfo {
+            captures: alloc::vec!["device".to_string()],
+            capacity: 1024,
+            assigned: 3,
+            dropped: 1,
+        };
+        metadata.inbound_keys = Some(keys.clone());
+        let json = serde_json::to_string(&metadata).unwrap();
+        let parsed: RecordMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.inbound_keys, Some(keys));
+    }
+}

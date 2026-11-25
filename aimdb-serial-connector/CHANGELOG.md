@@ -1,0 +1,137 @@
+# Changelog - aimdb-serial-connector
+
+All notable changes to the `aimdb-serial-connector` crate will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Fixed
+
+- **A restarted `SerialClient` keeps mirroring (#443).** `SerialClient` sent
+  no `hello`, so a host process restarted while the board kept running stayed
+  in the old session: its subscriptions reused ids the old session still
+  held, the board refused them, and records mirrored from the board went
+  silent until a board reset. `SerialClient::new` and `over_port` now open
+  every connection with a `hello`, ahead of their subscriptions and writes,
+  without waiting for the reply. A `hello` lost on the line is not resent.
+  `over_port` also writes a frame delimiter when it opens the port, so a
+  frame a previous process left half-written cannot swallow the `hello`.
+
+## [0.2.0] - 2026-11-03
+
+### Changed (breaking, wire)
+
+- **AimX 4.0 (#326).** Values carry their write stamp (`ts`); 3.x peers are
+  refused. `run_client` takes a `RuntimeContext`
+  (`RuntimeContext::new(Arc::new(adapter))` outside an instance).
+
+### Fixed
+
+- **Reconnecting over serial works every time (#328).** Every other client
+  that connected to a `SerialServer` without a board reset got no events: the
+  previous client's subscriptions lived on in the one session a UART carries.
+  A client's `hello` now starts a new session, ending the previous client's
+  subscriptions (see `aimdb-core`). A client that leaves without another one
+  connecting keeps its subscriptions streaming into the UART until the next
+  `hello`.
+
+## [0.1.0] - 2026-09-18
+
+### Changed
+
+- **Features name what the code needs; no runtime appears in the public surface.**
+  `connector` gates the COBS framer and the sugar over it — `framed`, the
+  one-shot `Dialer`/`Listener`, `SerialClient`/`SerialServer` — which need core's
+  session layer and nothing else. Its library graph is `aimdb-core` + `cobs`,
+  with no adapter, so **Embassy is no longer a feature of this crate**: an
+  Embassy caller enables `connector` and passes `EmbassyUart`, the same line a
+  FreeRTOS caller writes with its own UART.
+- **`std` gains a meaning it did not have.** It previously gated no code at all —
+  the sole `cfg(feature = "std")` was the `no_std` attribute — and carried an
+  unused `thiserror` dependency, now dropped. It adds core's `std` plus the
+  `tokio-serial` port backend behind `SerialPortDialer`, the one item here that
+  needs a specific async runtime, and the 23 crates (`serialport`, `nix`,
+  `libc`, …) that come with it. It also pulls `aimdb-tokio-adapter` (feature
+  `net`), so the byte source is the adapter's on both runtimes rather than
+  duplicated here — reversing the earlier decision to keep a concrete adapter off
+  the public feature, and making the internal `_test-tokio` feature redundant. It
+  is removed; `std` gates the host tests and `serial_demo` directly. A host
+  caller wanting only the neutral half enables `connector`, which builds fine on
+  std.
+- **`EmbassyFramed<Rd, Wr>` and `TokioFramed<S>` are removed (breaking).** Both
+  were one-liners over the generic `SerialFramed<S>`, neither had a call site
+  outside this crate's own tests, and naming an adapter in their definition was
+  the only thing forcing an adapter dependency into the features. Write
+  `SerialFramed<EmbassyUart<Rd, Wr>>` / `SerialFramed<TokioByteStream<S>>`.
+- **`tokio-runtime` and `embassy-runtime` are gone**, with no aliases: consumers
+  move to `std` and `connector` respectively. The `thumbv7em` type-check that
+  keeps the two byte sources on one code path survives as the internal
+  `_test-embassy` feature.
+- **One path for both runtimes (breaking).** `SerialServer::new` takes an
+  adapter byte stream (`EmbassyUart::new(rx, tx)`, `TokioByteStream(port)`)
+  instead of `(path, baud)` or split UART halves; the application opens the
+  device. `SerialClient::new(stream)` serves it once — with
+  `reconnect` off, since a moved-in stream cannot be reopened — and
+  `SerialClient::over_port(path, baud)` reopens and redials on a host.
+  `tokio_transport` and `embassy_transport` are deleted with the whole
+  `Tokio*`/`Embassy*` alias set — `SerialDialer` is now `SerialPortDialer`, and
+  `SerialListener`/`TokioSerialConnection` are gone.
+- **The host read chunk drops 256 → 64.** The deleted `TokioSerialConnection`
+  carried its own `READ_CHUNK = 256`; both paths now share `framing::READ_CHUNK`,
+  sized for an MCU UART ring, so a host reading a real port issues four times the
+  `read` calls per kilobyte. Kept deliberately — one code path, one chunk size —
+  and `SerialFramed`'s chunks are const generics, so a host-specific value stays
+  available without structural change.
+- **Reports through the `log_*` facade instead of `tracing::` directly** (design
+  050 §10.5), so a `log` destination — an FFI layer's, say — sees this crate's
+  events too. Each call site also shed the hand-written
+  `#[cfg(feature = "tracing")]` the facade carries itself. The `tracing` feature
+  no longer pulls `dep:tracing`; a mirrored `log` feature is added alongside it.
+  No change to what is emitted, or to a consumer that enables `tracing`.
+
+### Added
+
+- **`connector` — runtime-neutral client and server sugar.** `SerialServer<S>`
+  and `SerialClient` over any adapter byte stream, plus `OneShotDialer` /
+  `OneShotListener`: a UART is point-to-point, so the stream is served once —
+  the dialer then errors, the listener parks, because `serve` loops on `accept`
+  and would spin on an error.
+- **`framing` gains core's `Framer` — the connector reduced to framing.** `CobsFramer` against
+  core's `Framer` plus core's `FramedConnection` serve both runtimes; the byte
+  sources come from the adapters (`TokioByteStream`, `EmbassyUart`), so this crate
+  names no socket or UART type of its own.
+- **New crate — the COBS-framed serial/UART transport for AimDB remote access (Issue #122, follow-up to #39).** The serial sibling of `aimdb-uds-connector`: it contributes only the `Dialer`/`Listener`/`Connection` triple plus thin sugar; the AimX codec + dispatch and the runtime-neutral session engines (`run_client`/`serve`) are reused from `aimdb-core`. The wire is the same compact AimX JSON, framed with **COBS** (Consistent Overhead Byte Stuffing) and a `0x00` sentinel instead of a newline — self-synchronizing on a lossy/unframed serial medium, so a receiver that joins mid-stream resynchronizes on the next sentinel. Default scheme `"serial"`. Two runtime halves:
+  - **`tokio-runtime`** (std, host/gateway) — `TokioSerialConnection<S>` over any `AsyncRead + AsyncWrite` (a real `tokio_serial::SerialStream` in production, a `tokio::io::duplex()` in tests), with `SerialClient::new(path, baud)` (sugar over `SessionClientConnector<SerialDialer, AimxCodec>`) and `SerialServer` (sugar over `SessionServerConnector` + `AimxDispatch`). The listener is one-shot (serial is point-to-point).
+  - **`embassy-runtime`** (`no_std + alloc`, MCU) — thin sugar over the centralized Embassy session spine in `aimdb-embassy-adapter::connectors` (M17, [Design 033](../docs/design/033-M17-unify-connectors-drop-send.md)): this half contributes only the COBS `CobsFramer` (implementing the spine's `Framer`); the framed `EmbassyConnection` over `embedded-io-async` `Read`/`Write` halves (the common `BufferedUart::split()` shape), the one-shot dialer/listener/cell, and **all** the force-`Send` plumbing live in the adapter — this crate carries **no `unsafe`**. `SerialClient::new(rx, tx)` returns the spine's `EmbassySessionClient` (chain `.scheme(...)`/`.with_config(...)` on it); `SerialServer` stores the moved-in framed connection in the spine's `OneShotCell` and drives `serve`. The Embassy *server* half rides the `no_std` `AimxDispatch` landed in #120, so an MCU can answer `record.list`/`get`/`set`/`subscribe`/`drain` over a UART; the *client* half mirrors records to a gateway. Reconnect is disabled by default on Embassy (the spine's default — the UART peripheral is moved in and can't be re-acquired).
+- **`framing` module** — the shared COBS frame codec (`encode_frame` + a chunk-tolerant `FrameAccumulator`), pure `no_std + alloc`, so the round-trip is unit-tested independent of any transport.
+- **Examples — a real end-to-end serial test.** `examples/serial_demo.rs` (host, `--features _test-tokio`): an AimX client/server over a device path (a board's ST-LINK VCP at `/dev/ttyACM0`, or a `socat` PTY pair). `examples/embassy-serial-connector-demo/` (board): an STM32H563ZI Nucleo serving the `counter` record over USART3 ↔ the ST-LINK Virtual COM Port — the no_std `SerialServer` + `AimxDispatch` on real silicon, flashed via `probe-rs`, queried from the host over the wire.
+
+### Notes
+
+- **The Embassy half sends each frame in ring-sized (64-byte) chunks.** A HAL
+  `BufferedUart::write` is atomic-or-error (`embassy-stm32` returns `BufferTooLong`
+  for a single write larger than its TX ring), so a frame bigger than the buffer —
+  e.g. a `record.list` reply — would otherwise fail the whole send and drop the
+  session. Chunking sends a frame of any length given a TX buffer ≥ 64 bytes.
+- **An undecodable frame is skipped, not fatal.** `recv` drops a chunk that fails
+  to COBS-decode (line noise, or bytes from a session joined mid-stream) and
+  resyncs on the next sentinel rather than returning a transport error — so
+  transient corruption costs one frame, not the whole session. This matters most on
+  Embassy, where the default `reconnect: false` over a moved-in UART means a fatal
+  read error could never recover.
+- **The tokio `SerialDialer` flushes the OS input buffer on connect.** A real serial
+  port retains bytes across opens, so a half-read reply left by a previous (killed)
+  session would otherwise be read as a stale first frame — failing to decode and
+  desyncing the stream until the next COBS sentinel (a skipped frame or two of
+  churn, per the resync above). Flushing on connect avoids even that, giving every
+  session a clean start.
+- **Validated end-to-end on an STM32H563ZI Nucleo** over the ST-LINK VCP:
+  `record.list` / `record.get` / `record.set` and streaming subscriptions all
+  round-trip MCU↔host.
+- **`embedded-io-async` is pinned to 0.7** (the workspace dep was bumped 0.6 → 0.7) so a HAL `BufferedUart` (e.g. `embassy-stm32`, which uses 0.7) satisfies the connector's `Read`/`Write` bounds without a trait-version skew. Wire the Embassy half from a `BufferedUart::split()` — the plain async `UartRx` does **not** implement `embedded-io-async::Read`, only the buffered/ring-buffered variants do.
+
+- This is the first *raw-peripheral* session connector — MQTT/KNX sidestep peripheral ownership by pulling a `Send + Sync` `embassy_net::Stack` from the runtime adapter. The single-core force-`Send` bridge a moved-in peripheral requires lives **once, audited** in `aimdb-embassy-adapter::connectors` (M17); this crate has no `unsafe` and no `SendFutureWrapper` use.
+- The `serial://` scheme constant lands here; the host-side `--connect serial:///dev/ttyUSB0?baud=115200` resolver that maps that URL to a `SerialDialer` landed in `aimdb-client`'s `endpoint` module (Issue #123), wired into `aimdb-cli`/`aimdb-mcp` behind their `transport-serial` feature.
+- The internal `_test-tokio` feature gates the host tokio integration test's adapter dependency; it is kept off the public `tokio-runtime` feature (a connector shouldn't pull a concrete adapter) and out of `[dev-dependencies]` (an unconditional tokio adapter would force `aimdb-core/std` into the `no_std` embassy test build).

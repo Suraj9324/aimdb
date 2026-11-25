@@ -1,0 +1,444 @@
+//! Integration tests for aimdb-sync
+//!
+//! These tests verify end-to-end functionality of the synchronous API wrapper.
+// The whole file exercises `attach()` / `SyncProducer` / `SyncConsumer`, none of
+// which exist without `std`.
+#![cfg(feature = "std")]
+use aimdb_core::{buffer::BufferCfg, AimDbBuilder, DbError};
+use aimdb_sync::AimDbBuilderSyncExt;
+use aimdb_sync::{AimDbHandle, SyncConsumer, SyncError, SyncProducer};
+use aimdb_tokio_adapter::{TokioAdapter, TokioRecordRegistrarExt};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct TestData {
+    id: u32,
+    value: String,
+}
+
+fn test_value() -> TestData {
+    TestData {
+        id: 1,
+        value: "test".to_string(),
+    }
+}
+
+fn data(id: u32) -> TestData {
+    TestData {
+        id,
+        value: format!("value-{}", id),
+    }
+}
+
+fn attach(cfg: BufferCfg) -> AimDbHandle {
+    let key_test_data_1 = aimdb_core::Name::<TestData>::new("test.data");
+    let adapter = Arc::new(TokioAdapter);
+    let mut builder = AimDbBuilder::new().runtime(adapter);
+
+    builder.configure(key_test_data_1, |reg| {
+        reg.buffer(cfg).tap(|_ctx, _consumer| async move {
+            // No-op tap just to satisfy validation
+        });
+    });
+
+    builder.attach().expect("Failed to attach")
+}
+
+fn setup(cfg: BufferCfg) -> (AimDbHandle, SyncProducer<TestData>, SyncConsumer<TestData>) {
+    let key_test_data_2 = aimdb_core::Name::<TestData>::new("test.data");
+    let handle = attach(cfg);
+    let producer = handle
+        .producer(key_test_data_2)
+        .expect("Failed to create producer");
+    let consumer = handle
+        .consumer(key_test_data_2)
+        .expect("Failed to create consumer");
+    (handle, producer, consumer)
+}
+
+/// Test basic producer-consumer flow
+#[test]
+fn test_basic_producer_consumer() {
+    let (handle, producer, mut consumer) = setup(BufferCfg::SpmcRing { capacity: 10 });
+
+    // Produce a value
+    let test_value = test_value();
+    producer.set(test_value.clone()).expect("Failed to produce");
+
+    // Consume the value
+    let received = consumer.get().expect("Failed to consume");
+    assert_eq!(received.value, test_value);
+
+    handle.detach().expect("Failed to detach");
+}
+
+/// Test multiple producers and consumers
+#[test]
+fn test_multi_threaded_producer_consumer() {
+    let key_test_data_3 = aimdb_core::Name::<TestData>::new("test.data");
+    let handle = attach(BufferCfg::SpmcRing { capacity: 100 });
+
+    // Create multiple consumers
+    let mut consumer1 = handle
+        .consumer(key_test_data_3)
+        .expect("Failed to create consumer 1");
+    let mut consumer2 = handle
+        .consumer(key_test_data_3)
+        .expect("Failed to create consumer 2");
+
+    // Spawn consumer threads
+    let c1_handle = thread::spawn(move || {
+        let mut received = Vec::new();
+        for _ in 0..10 {
+            if let Ok(data) = consumer1.get() {
+                received.push(data);
+            }
+        }
+        received
+    });
+
+    let c2_handle = thread::spawn(move || {
+        let mut received = Vec::new();
+        for _ in 0..10 {
+            if let Ok(data) = consumer2.get() {
+                received.push(data);
+            }
+        }
+        received
+    });
+
+    // Create multiple producers
+    let producer1 = handle
+        .producer(key_test_data_3)
+        .expect("Failed to create producer 1");
+    let producer2 = producer1.clone();
+
+    let p1_handle = thread::spawn(move || {
+        for i in 0..10 {
+            let data = TestData {
+                id: i,
+                value: format!("producer1-{}", i),
+            };
+            producer1.set(data).expect("Failed to produce");
+        }
+    });
+
+    let p2_handle = thread::spawn(move || {
+        for i in 10..20 {
+            let data = TestData {
+                id: i,
+                value: format!("producer2-{}", i),
+            };
+            producer2.set(data).expect("Failed to produce");
+        }
+    });
+
+    // Wait for all threads
+    p1_handle.join().unwrap();
+    p2_handle.join().unwrap();
+    let c1_data = c1_handle.join().unwrap();
+    let c2_data = c2_handle.join().unwrap();
+
+    // Verify consumers received data
+    assert_eq!(c1_data.len(), 10);
+    assert_eq!(c2_data.len(), 10);
+
+    handle.detach().expect("Failed to detach");
+}
+
+/// Test timeout operations
+#[test]
+fn test_timeout_operations() {
+    let (handle, producer, mut consumer) = setup(BufferCfg::SpmcRing { capacity: 10 });
+
+    // Test get_timeout on empty buffer (should timeout)
+    let result = consumer.get_with_timeout(Duration::from_millis(100));
+    assert!(matches!(result, Err(SyncError::GetTimeout)));
+
+    // Produce a value
+    let test_value = test_value();
+    producer
+        .set(test_value.clone())
+        .expect("Failed to produce with timeout");
+
+    // Get with timeout (should succeed)
+    let received = consumer
+        .get_with_timeout(Duration::from_secs(2))
+        .expect("Failed to consume with timeout");
+    assert_eq!(received.value, test_value);
+
+    handle.detach().expect("Failed to detach");
+}
+
+/// Test an immediate consumer read.
+#[test]
+fn test_non_blocking_consumer_operation() {
+    let (handle, producer, mut consumer) = setup(BufferCfg::SpmcRing { capacity: 10 });
+
+    // Try get on empty buffer (should fail)
+    let result = consumer.try_get();
+    assert!(matches!(result, Err(SyncError::GetTimeout)));
+
+    // Set should succeed immediately
+    let test_value = test_value();
+    producer.set(test_value.clone()).expect("Failed to set");
+
+    // Use blocking get to ensure we receive the value
+    // (try_get is inherently racy in this test scenario)
+    let received = consumer
+        .get_with_timeout(Duration::from_secs(1))
+        .expect("Failed to receive value");
+    assert_eq!(received.value, test_value);
+
+    // Now try_get on empty buffer again (should fail)
+    let result = consumer.try_get();
+    assert!(matches!(result, Err(SyncError::GetTimeout)));
+
+    handle.detach().expect("Failed to detach");
+}
+
+/// Test graceful shutdown
+#[test]
+fn test_graceful_shutdown() {
+    let key_test_data_4 = aimdb_core::Name::<TestData>::new("test.data");
+    let handle = attach(BufferCfg::SpmcRing { capacity: 10 });
+
+    let producer = handle
+        .producer(key_test_data_4)
+        .expect("Failed to create producer");
+
+    // Produce some values
+    for i in 0..5 {
+        producer.set(data(i)).expect("Failed to produce");
+    }
+
+    // Detach should succeed
+    handle.detach().expect("Failed to detach");
+}
+
+/// Test detach with timeout
+#[test]
+fn test_detach_with_timeout() {
+    let handle = attach(BufferCfg::SpmcRing { capacity: 10 });
+
+    // Detach with timeout should succeed quickly
+    handle
+        .detach_timeout(Duration::from_secs(5))
+        .expect("Failed to detach with timeout");
+}
+
+/// Test error handling - runtime shutdown
+#[test]
+fn test_runtime_shutdown_error() {
+    let (handle, producer, mut consumer) = setup(BufferCfg::SpmcRing { capacity: 10 });
+
+    // Shut down the runtime
+    handle.detach().expect("Failed to detach");
+
+    // Operations should now fail with RuntimeShutdown
+    let test_value = test_value();
+
+    let result = producer.set(test_value);
+    assert!(matches!(result, Err(SyncError::RuntimeShutdown)));
+
+    let result = consumer.get();
+    assert!(matches!(result, Err(SyncError::RuntimeShutdown)));
+}
+
+/// `check()` answers the same question `set()` does, without publishing.
+#[test]
+fn check_reports_what_a_publish_would_find() {
+    let (handle, producer, _consumer) = setup(BufferCfg::SpmcRing { capacity: 10 });
+
+    producer.check().expect("usable while attached");
+
+    handle.detach().expect("Failed to detach");
+
+    // The same verdict `set()` reaches, arrived at without sending anything.
+    assert!(matches!(producer.check(), Err(SyncError::RuntimeShutdown)));
+    assert!(matches!(
+        producer.set(test_value()),
+        Err(SyncError::RuntimeShutdown)
+    ));
+}
+
+/// Test an immediate consumer read after runtime shutdown.
+#[test]
+fn test_runtime_shutdown_error_non_blocking() {
+    let key_test_data_5 = aimdb_core::Name::<TestData>::new("test.data");
+    let handle = attach(BufferCfg::SpmcRing { capacity: 10 });
+    let mut consumer = handle
+        .consumer(key_test_data_5)
+        .expect("Failed to create consumer");
+
+    // Shut down the runtime
+    handle.detach().expect("Failed to detach");
+
+    // Immediate reads should now fail with RuntimeShutdown too
+    let result = consumer.try_get();
+    assert!(matches!(result, Err(SyncError::RuntimeShutdown)));
+}
+
+/// Test error handling - reading messages sent before the shutdown
+#[test]
+fn test_runtime_shutdown_after_produce_read_error() {
+    let (handle, producer, mut consumer) = setup(BufferCfg::SpmcRing { capacity: 10 });
+
+    let test_value = test_value();
+
+    let result = producer.set(test_value.clone());
+    assert!(matches!(result, Ok(())));
+
+    // Shut down the runtime
+    handle.detach().expect("Failed to detach");
+
+    let result = consumer.get().expect("Failed to get the value");
+    assert_eq!(result.value, test_value);
+
+    let result = consumer.get();
+    println!("{:?}", result);
+    assert!(matches!(result, Err(SyncError::RuntimeShutdown)));
+}
+
+/// Test buffer semantics - SPMC Ring
+#[test]
+fn test_spmc_ring_semantics() {
+    let key_test_data_6 = aimdb_core::Name::<TestData>::new("test.data");
+    let handle = attach(BufferCfg::SpmcRing { capacity: 5 });
+
+    let producer = handle
+        .producer(key_test_data_6)
+        .expect("Failed to create producer");
+    let mut consumer1 = handle
+        .consumer(key_test_data_6)
+        .expect("Failed to create consumer 1");
+    let mut consumer2 = handle
+        .consumer(key_test_data_6)
+        .expect("Failed to create consumer 2");
+
+    // Produce multiple values
+    for i in 0..5 {
+        producer.set(data(i)).expect("Failed to produce");
+    }
+
+    // Both consumers should be able to get values independently
+    let c1_data = consumer1.get().expect("Consumer 1 failed");
+    let c2_data = consumer2.get().expect("Consumer 2 failed");
+
+    // Each consumer gets their own copy
+    assert_eq!(c1_data.value.id, 0);
+    assert_eq!(c2_data.value.id, 0);
+
+    handle.detach().expect("Failed to detach");
+}
+
+/// Test buffer semantics - get_latest()
+///
+/// This test demonstrates how to imitate SingleLatest semantics
+/// with a non-singleton buffer with the sync API by using the get_latest
+#[test]
+fn test_single_latest_semantics() {
+    let (handle, producer, mut consumer) = setup(BufferCfg::SpmcRing { capacity: 3 });
+
+    // Produce first value and wait for it to propagate
+    let initial_value = TestData {
+        id: 100,
+        value: "initial".to_string(),
+    };
+    producer.set(initial_value).expect("Failed to produce");
+
+    // Consume first value to establish the subscription
+    let first = consumer.get().expect("Failed to consume initial value");
+    assert_eq!(first.value.id, 100);
+
+    // Now produce multiple values rapidly
+    for i in 1..=5 {
+        producer.set(data(i)).expect("Failed to produce value");
+    }
+
+    // Use get_latest() to drain the channel and get the most recent value.
+    // BufferLagged errors occurring during it are ignored
+    let latest = consumer.get_latest().expect("Failed to get latest");
+
+    // Should get the last value (5) since get_latest() drains the channel
+    assert_eq!(
+        latest.value.id, 5,
+        "get_latest() should return the most recent value by draining the channel. Got {}",
+        latest.value.id
+    );
+
+    // Verify channel is now empty
+    let result = consumer.try_get();
+    assert!(
+        matches!(result, Err(SyncError::GetTimeout)),
+        "Channel should be empty after get_latest()"
+    );
+
+    handle.detach().expect("Failed to detach");
+}
+
+/// Test get_latest() with timeout
+#[test]
+fn test_get_latest_with_timeout() {
+    let (handle, producer, mut consumer) = setup(BufferCfg::SpmcRing { capacity: 3 });
+
+    // Test timeout on empty buffer
+    let result = consumer.get_latest_with_timeout(Duration::from_millis(50));
+    assert!(matches!(result, Err(SyncError::GetTimeout)));
+
+    // Produce values rapidly
+    for i in 1..=5 {
+        producer.set(data(i)).expect("Failed to produce value");
+    }
+
+    // Should get the latest value with timeout
+    let latest = consumer
+        .get_latest_with_timeout(Duration::from_secs(1))
+        .expect("Failed to get latest with timeout");
+
+    assert_eq!(latest.value.id, 5, "Should get the most recent value (5)");
+
+    handle.detach().expect("Failed to detach");
+}
+
+/// Test that produce errors are properly propagated back to the sync caller
+#[test]
+fn test_error_propagation() {
+    let key_test_data_7 = aimdb_core::Name::<TestData>::new("test.data");
+    // Build a database WITHOUT registering TestData
+    // This will cause produce() to fail with RecordKeyNotFound
+    let adapter = Arc::new(TokioAdapter);
+    let builder = AimDbBuilder::new().runtime(adapter);
+
+    let handle = builder.attach().expect("Failed to attach");
+
+    // Create a producer for an unregistered type/key
+    // Note: producer creation succeeds, but set() should fail
+    let producer = handle
+        .producer(key_test_data_7)
+        .expect("Failed to create producer");
+
+    // Try to produce a value - this should fail because the key is not registered
+    let test_value = test_value();
+
+    let result = producer.set(test_value.clone());
+
+    // Verify the error is propagated (not silently logged)
+    assert!(
+        result.is_err(),
+        "Expected produce to fail for unregistered key"
+    );
+
+    // Verify it's the correct error type (now RecordKeyNotFound with key-based API)
+    match result {
+        Err(SyncError::Db(DbError::RecordKeyNotFound { .. })) => {
+            // Expected error
+        }
+        other => panic!("Expected RecordKeyNotFound error, got: {:?}", other),
+    }
+
+    handle.detach().expect("Failed to detach");
+}

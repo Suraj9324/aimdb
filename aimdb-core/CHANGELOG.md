@@ -1,0 +1,1109 @@
+# Changelog - aimdb-core
+
+All notable changes to the `aimdb-core` crate will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Breaking — typed record keys (design 063)
+
+- Add TypedName, TypedKey and Name. Record registration, handles, direct reads/writes, transforms and joins infer payloads from declarations. Remove bare-string typed access and public schema setters.
+- Add a schema type-state: `TypedKey::Schema` (`Declared` / `Undeclared`), `SchemaState`, `ContractDeclared`, and a third parameter on `RecordRegistrar<'a, T, S = Undeclared>`. `configure` hands out the key's state. `Input` / `Output` take the state as a parameter (`impl<T, S: SchemaState> Input<T, S> for MyInput`). `ContractOutboundLink` / `ContractInboundLink` (from `into_contract()`) wire only into `ContractDeclared` records. `Name<T>` gains `Debug`.
+
+### Added — value envelopes (design 062)
+
+- Allocation-free `ContractRef`, `Envelope`, and `HeaderWriter` define a compact
+  codec-independent header, with forward-compatible stamp/extension parsing.
+- Ingest errors carry countable rejection reasons. Registered inbound links
+  expose shared admission and upgrade counters through metadata/metrics; accepted
+  values receive local write stamps. Counters are lock-free native atomics:
+  64-bit where the target has them, otherwise (e.g. thumbv7em) 32-bit and
+  saturating at `u32::MAX`. They add no `portable-atomic` feature. Raw deserializers
+  now return `IngestError` instead of `String` (`.into()` preserves ordinary
+  decode errors).
+- An admission rejection carries what was received and accepted as data
+  (`AdmissionContext`, `AdmissionDetail`) and formats its diagnostic only when
+  displayed (`IngestError::detail`, `Display`), so rejecting a frame for its
+  header, contract, version, shape or codec does not allocate.
+- AimX client links refuse an inline envelope at `build()`. `AimxCodec` splices
+  payloads into its frames as JSON, so the binary header failed to encode and
+  the client dropped the session shared by every link. `EnvelopeCodec` gains
+  `carries_inline_envelopes` (default `true`, `false` for `AimxCodec`), and
+  `pump_client` checks it for `ws-client`, serial, TCP and UDS client links.
+  `session::refuse_inline_envelopes` is the same check for a connector that
+  collects its own routes; the `ws://` server uses it.
+- Link builders can finalize envelope strategies during registration. Transports
+  retain their existing byte-oriented SPI, and bare payloads remain the default.
+
+### Changed (wire)
+
+- **`record.get` is a single, non-destructive read (#444).** It returns the
+  buffer's own snapshot (`SingleLatest`, `Mailbox`) and never touches the
+  connection's drain cursor, so only `record.drain` advances it. The fallback
+  that drained a ring to answer `record.get` is gone: it made a point-in-time
+  read wait for a future write and consumed events a later `record.drain`
+  should have returned. A ring (`SpmcRing`) now answers with the new error
+  code `unsupported`; read it with `record.drain` (unread events) or
+  `record.subscribe` (new ones). An empty `SingleLatest`/`Mailbox` record and
+  an unknown name answer `not_found` at once. A ring registered with
+  `buffer_raw()` and no `buffer_cfg()` answers `not_found`, since core cannot
+  tell it is a ring.
+
+### Added
+
+- **`RpcError::Unsupported` (#444),** wire code `"unsupported"`: the method
+  exists but the target cannot serve it. Older clients decode an unknown code
+  as `internal`.
+
+### Removed (breaking)
+
+- **Obsolete AimX message types (#419).** `remote::{Request, Response,
+  ErrorObject, Event}` are gone. They predate the shared session codec and
+  had no callers; the AimX wire path is `session::aimx`.
+
+### Changed (breaking)
+
+- **`QueryHandlerFn` returns typed rows (#429):**
+  `Result<Vec<QueryRecord>, String>`, sorted by `ts` ascending, instead of a
+  ready-made `{records, total}` JSON value.
+- **`record.query` params are resolved before the handler runs (#430).**
+  Every transport parses them with the new `QueryHandlerParams::from_json`,
+  which applies the defaults: `name` `#` and `limit` `DEFAULT_QUERY_LIMIT`
+  (1). `QueryHandlerParams::limit` is now `usize`; a custom `QueryHandlerFn`
+  that relied on `None` now receives 1.
+- **Wire: an exact-topic AimX subscribe sends a late-join snapshot (#438),**
+  as wildcard subscribes and WebSocket already do: the record's current
+  value as a `snap` frame, then events from `seq` 2. A record with no
+  current value (none written yet, or an `SpmcRing`) sends none. The value a
+  fresh reader starts on is no longer also sent as the first event, on exact
+  and wildcard subscribes alike.
+
+### Removed
+
+- The crate's `build.rs` (#419). Its feature checks named features the
+  manifest no longer declares, and nothing read the `feature_std`,
+  `feature_no_std` or `embedded_target` cfgs it emitted.
+
+### Added
+
+- `RecordRegistrar::record_key()` (#426), so extension crates can name
+  per-record state after the record. `aimdb-persistence` uses it.
+- **`OutboundLatest` (#434):** each outbound link's current value, rendered on
+  demand through the link's topic writer and serializer, with the same route
+  ids as `OutboundRoutes`. Connectors build late-join snapshots from it
+  instead of caching what they sent. Records without a current value
+  (`SpmcRing`, or nothing written yet) render nothing.
+- **`EnvelopeCodec::hello` (#443):** the request a client opens each
+  connection with under `ClientConfig::sends_hello`. Defaults to `None`, which
+  keeps the `Ping`/`Pong` handshake; `AimxCodec` returns AimX's `hello`.
+
+### Changed
+
+- **`ClientConfig::sends_hello` sends the codec's hello (#443)** when it has
+  one, instead of a `Ping`, so it starts a session on servers that serve one
+  long connection. The hello goes out once per connection, ahead of every
+  command, and its reply is not awaited: frame order is enough. A reply
+  refusing the protocol version is logged; the client keeps running. Codecs
+  without a hello keep the `Ping`/`Pong` exchange, which still waits.
+
+### Changed (wire)
+
+- **AimX `record.query` without a query handler returns `not_found` (#427),**
+  not `internal`, matching WebSocket. A handler that runs and fails still
+  returns `internal`.
+- **The `record.query` reply drops `total` (#429)** and is `{"records": [...]}`.
+  `total` only ever repeated the row count; use the length of `records`.
+
+## [3.0.0] - 2026-11-03
+
+### Changed (breaking, wire)
+
+- **AimX 4.0 (#326).** `ts` (write stamp, integer nanoseconds since instance
+  start) is mandatory on `event` and `snap`; `record.get` replies
+  `{value, ts}`, `record.drain` values are `{value, ts}`, `record.set` echoes
+  `{status, value, ts}`. A value frame without `ts` is malformed; 3.x peers
+  are refused at `hello`. `session::aimx::value_reply` builds the `get` reply.
+
+### Changed
+
+- **Link builders are generic over what they are attached to (#389).**
+  Options live on `OutboundLinkBuilder<T, R>` / `InboundLinkBuilder<T, R>`;
+  `OutboundConnectorBuilder` / `InboundConnectorBuilder` remain as aliases,
+  so existing `link_to(..)…finish()` code and extension impls compile
+  unchanged. Both builders are `#[must_use]`: a link that is never finished
+  or registered now warns (fails under `-D warnings`) instead of being
+  dropped silently.
+- The "conflicting writers" build error names origin kinds
+  (`source + inbound link`) instead of methods.
+
+### Added
+
+- **Links as values: `reg.input(..)` / `reg.output(..)` (#389).**
+  `OutboundLink::new(url)` / `InboundLink::new(url)` build a link before its
+  record exists; `RecordRegistrar::output` / `input` register it through the
+  same validation as `finish()`. Both take anything implementing the new
+  `Input<T>` / `Output<T>` traits; a link for the wrong record type or
+  direction is a compile error with a readable message.
+
+- **`AimDbBuilder::connect` returns a `ConnectorHandle` (#390).**
+  `OutboundLink::on(handle, "sensors/temp")` / `InboundLink::on(..)` take the
+  connector's scheme; a full URL must match it. A wrong scheme or another
+  builder's handle is reported by `build()`.
+
+- **`with_schema(name, version)` on link builders (#391).** Reports the
+  record's schema when the link is registered, like `reg.schema(..)`.
+
+- **Build identity and AimX 3.1 (#331).** `AimDbBuilder::build_info`,
+  `instance_name` and `instance_uid` (checked by `build()`), and
+  `AimDb::identity()`. AimX gains `instance.info` and `instance.post_link`;
+  the welcome carries `instance_name`. Additive: 3.0 and 3.1 interoperate.
+
+- **Graph nodes report each record's schema and outbound link addresses
+  (#332).** `RecordRegistrar::schema(name, version)` sets the data-contract
+  schema a record carries; setting a different one on the same record fails
+  `build()`. `GraphNode` gains `schema: Option<SchemaInfo>` and
+  `outbound_links: Vec<String>` (each link's `scheme://resource`);
+  `has_outbound_link` stays and equals `!outbound_links.is_empty()`. Both are
+  always sent in `graph.nodes`, as `null` and `[]` when empty. `record.list`
+  fills `schema_type` from the same slot and gains `schema_version`.
+
+- **`AimDbBuilder::start_order_seed(seed)` permutes the record task start
+  order (#325).** Behind the new `start-order-seed` feature, for tests and
+  simulation. With a seed, the topological sort draws the next record from
+  all records ready at that point using a seeded SplitMix64, so different
+  seeds explore different valid start orders and the same seed replays one.
+  Every record still starts after its inputs. Without a seed, records start
+  in registration order (#324). `graph.topo_order` reports the order used.
+  `DependencyGraph::build_and_validate_seeded` exposes the same choice.
+
+- **Typed current-value reads with `AimDb::latest::<T>(key)` (#363).**
+  Returns `DbResult<Option<T>>` without consuming the value or requiring
+  serde traits, the `remote` feature, or remote-access registration. Unknown
+  keys and mismatched types return errors; records without a value or buffer,
+  and buffers without a canonical latest value (`SpmcRing`), return `Ok(None)`.
+  Available on both std and no_std.
+
+- **Core log lines reach `defmt` (#352).** `log_trace!` … `log_error!` forward
+  to `defmt` under the calling crate's `defmt` feature, as a third destination
+  next to `tracing` and `log`. On an Embassy device every core log line now
+  reaches the probe log, including the session engine's (session reset,
+  refused and ended subscriptions, `serve`'s accept-failure summary), which
+  had no `defmt` output.
+- **`LogDisplay` / `LogDebug`** wrap a type that does not implement
+  `defmt::Format` in a log call (`log_warn!("… {}", LogDisplay(&e))`): through
+  `Display` / `Debug` everywhere, `defmt::Display2Format` / `Debug2Format`
+  under `defmt`. `tracing`/`log` output is unchanged.
+- **`defmt::Format` under `defmt`** for `TransportError`, `CodecError`,
+  `AuthError`, `FrameFault` (derived) and `DbError` (through its `Display`
+  text, since its `std`-only variants carry `io::Error`). Core's `defmt`
+  feature enables `defmt/alloc`, for `String`, `Vec<String>` and `Arc<str>`.
+
+- **Topic patterns on inbound links.** `{name}` captures one
+  level, `{name..}` the rest; the syntax is checked at `build()`, and the
+  connector's `TopicGrammar` compiles each pattern into a `TopicFilter` when it
+  builds. `ExactGrammar` is the grammar for connectors without wildcards.
+- **`InboundConnectorBuilder::with_match_deserializer`** passes a `TopicMatch`
+  (`topic()`, `get(name)`, `key()`) borrowed from the router's stack, and a
+  borrowed `&RuntimeContext`, so no reference count changes per message.
+- **`.key(name, capacity)`** interns a capture into a `KeyId` from one table
+  per record, shared by all its keyed links. The table grows as values arrive;
+  when full, the message is dropped and counted. `AimDb::inbound_key_name`
+  resolves a key; `RecordMetadata::inbound_keys` (`InboundKeysInfo`) reports
+  captures, capacity, assigned and dropped.
+- **`AimDb::inbound_router(scheme, grammar)`** compiles a scheme's links,
+  including patterns a `TopicResolverFn` returns, and reports every link it
+  cannot compile at once. `Router::subscriptions()` lists the filters to
+  subscribe, without those another filter covers.
+- **`OutboundRoutes`: one pull for every outbound link of a scheme.**
+  `OutboundRoutes::new(db, scheme)` builds a route per link, each with
+  its record's reader, topic writer and serializers, and a lock-free ready set
+  that wakes only routes with data. A connector's own task calls
+  `next().await` (or `poll_next`, or `poll_stage` / `take_staged` / `reject`
+  to commit a message only once it has room) and receives an `OutboundMessage`
+  borrowing the route's topic and payload buffers, so a message allocates
+  nothing on a scratch serializer. `routes()` lists `RouteInfo` (default topic,
+  the record's `type_id`, `ConnectorConfig` with `record_index`, topic and
+  payload capacities);
+  `stats(id)` reports `RouteStats` (`sent`, `rejected`, `lagged`,
+  `topic_overflow`, `serialize_failed`). Lag, serialize failures and a closed
+  buffer are handled and counted inside; `next` ends when every route has
+  closed. `OutboundPayload` is `Borrowed` or `Owned`, with `as_slice` and
+  `into_vec`.
+- **`InboundDispatch`: the inbound counterpart.** `InboundDispatch::new(db,
+  scheme, grammar)` wraps the router and the runtime context;
+  `dispatch(topic, payload)` deserializes and produces, logging failures, and
+  `subscriptions()` lists the filters to subscribe. It is `Clone`, so the
+  session task, the event loop and the inbound pumps share one.
+  `routes()` lists an `InboundRouteInfo` per link (resolved topic, the
+  record's `type_id`, `ConnectorConfig` with `record_index`), for parsing a
+  connector's per-link options once at build; a topic resolver runs once per
+  route.
+- **`connector::WIRE_FORMAT_KEY` (`aimdb.wire_format`)**, a reserved link
+  config key naming the codec's wire format. Codec verbs record it;
+  `with_serializer`, `with_serializer_into`, `with_deserializer` and
+  `with_match_deserializer` remove it, so a link carries a format exactly when
+  a known codec installed its current (de)serializer. Keys prefixed `aimdb.`
+  are reserved.
+- **`with_topic_writer(capacity, writer)` and `with_topic_fn(capacity, f)`**
+  replace `with_topic_provider`. The writer receives the value and a
+  `TopicBuf` (`push_str`, `write!`) of `capacity` bytes and returns
+  `Ok(true)` to publish there or `Ok(false)` for the link's default topic. A
+  topic that overflows the buffer skips the value and is counted in
+  `topic_overflow`, whatever the writer returns.
+- **`Reader::poll_recv`**, the poll form of `recv`, for tasks that wait on
+  several readers at once. `recv` is unchanged.
+
+### Changed (breaking, API)
+
+- **Write timestamps (#326, design 058).** Every record write is stamped from
+  one monotonic clock per instance, and every read returns the stamp:
+  `Reader::recv`/`try_recv`, `AimDb::latest`, the JSON reads and
+  `RecordValue` (`metadata()`, `stamp()`) yield `Stamped<T>` (`.value`,
+  `.stamp()`), with the metadata in an opaque `WriteMetadata`. Buffers hold
+  `Stamped<T>`. `JoinTrigger::Input` gains the input's `metadata` (now
+  `#[non_exhaustive]`; `metadata()`/`stamp()`), `OutboundMessage` gains
+  `metadata`. Time reads moved to the new `InstanceClock` (`now()`,
+  `unix_time()`): `RuntimeOps` drops `now_nanos`/`unix_time` and gains
+  `new_clock()`, `RuntimeContext` carries the clock (`ctx.time().now()`
+  returns a `Stamp`), `run_client` takes a `RuntimeContext`, and
+  `AimDb::now()` reads the instance clock.
+
+- **`GraphNode` has two new public fields, `schema` and `outbound_links`
+  (#332).** Code that builds a `GraphNode` with a struct literal must set
+  them. The AimX JSON change is additive.
+- **Routes carry their record's index (#264).** `RouteInfo` and
+  `InboundRouteInfo` gain `record_index: usize`, always set by core: the
+  registration index of the record a route belongs to, the same `record_id`
+  `AimDb::list_records` reports. A topic alone cannot identify the record,
+  since several records may share one, so a connector enforcing per-record
+  authorization reads it here; the WebSocket connector uses it to gate
+  delivery against each client's granted records. A link option named
+  `record_index` is an ordinary protocol option. `ConnectorConfig` is now
+  `#[non_exhaustive]`: build it with `Default` or `from_query` rather than a
+  struct literal.
+
+- **Connector SPI: the push pumps are gone.** Removed
+  `session::pump_sink`, `session::pump_source`, `Source`, the `Connector`
+  trait (with `transport::Connector::publish`), `TopicProvider`,
+  `OutboundRoute`, `AimDb::collect_outbound_routes`, `SerializedSource`,
+  `SerializedReader`, `SerializedValue`, `SerializedValueInto`,
+  `SerializedPayload` and `SourceFactoryFn`. A connector now builds
+  `InboundDispatch` and `OutboundRoutes` in `build()` and drives both
+  directions from its own transport task; core spawns no task per connector or
+  per route.
+- **`with_topic_provider` is replaced by `with_topic_writer` /
+  `with_topic_fn`**, which write the topic into a bounded buffer instead of
+  returning an `Option<String>`.
+- **`pump_client(db, scheme, inbound, handle)` returns `DbResult<Vec<_>>`**
+  and drives all outbound routes from one task instead of one per route, plus
+  one future per inbound subscription. During an outage the engine's command
+  queue, not the record buffer, decides what survives.
+- **`OutboundConnectorLink`'s route factory and `new` are `pub(crate)`, and the
+  `router` module is no longer public.**
+
+- **One inbound path.** Removed `AimDb::collect_inbound_routes`,
+  `RouterBuilder`, `Route` and the public `Router::new`; a `Router` comes from
+  `inbound_router`. `IngestFn` takes the `TopicMatch`, and
+  `InboundConnectorLink` has one `ingest_factory` of that type.
+  `pump_source(db, router, src)` and `pump_client(db, scheme, router, handle)`
+  take the router, so a connector subscribes and routes with the same one.
+- **`InboundConnectorLink` gains `key`, `RecordMetadata` gains
+  `inbound_keys`; both are now `#[non_exhaustive]`.** The serde form of
+  `RecordMetadata` stays backward compatible.
+- **Outbound links reject `{…}` topics** at `build()`: a filter cannot be
+  published to.
+- **`{` and `}` in topics are pattern syntax** on every connector, with no
+  escape: a topic containing a literal brace can no longer be linked.
+
+### Changed
+
+- **Record tasks start in a stable order (#324).** Among records ready at
+  once, the dependency graph's topological sort now takes them in
+  registration order instead of hash-map order, which was randomly seeded and
+  changed with every `build()`, even within one process. Records that depend
+  on others still start after their inputs. What is now stable is the
+  topological order, and with it the order record tasks are collected and
+  started in; `graph.topo_order` over AimX and `aimdb graph order` can be
+  diffed across restarts. Once running, tasks are still polled as their
+  timers and I/O wake them, so this promises no order among simultaneous
+  updates. No API change.
+
+- **The `log_*!` macros carry a `defmt` arm (#352).** A crate forwarding its
+  `defmt` feature to the facade needs `dep:defmt` itself
+  (`defmt = ["dep:defmt", "aimdb-core/defmt"]`; `defmt`'s macros expand to
+  absolute paths), and every argument must implement `defmt::Format` (or be
+  wrapped in `LogDisplay` / `LogDebug`). A crate that never builds with
+  `defmt` names the feature through `check-cfg`, or `unexpected_cfgs` fires
+  at every call. The router's and the session client's hand-written `defmt`
+  mirrors are gone; the device shows the `log_*!` text.
+
+- **`build()` checks transform and join input types** (#330). An input read as
+  a type other than the one its record holds — `.transform::<Pascal, _>("temp", …)`
+  on a `Celsius` record, or `JoinBuilder::input::<I>` likewise — is reported
+  in `DbError::InvalidConfiguration`, keyed by the output record and naming
+  the input key and both types. Such a configuration used to build, and the
+  transform's consumer then failed to resolve at runtime: the output record
+  never got a value, a join ran without that input, and with default
+  features nothing was logged.
+
+### Fixed
+
+- **`link_out` graph edges name their protocol (#332).** Each outbound link
+  now has its own edge with the link's scheme as `protocol`; before, a record
+  had one edge with `protocol: "unknown"` however many links it had.
+
+- **`session::serve` no longer spins on a failing listener (#351).** It
+  logged a failed `accept` and called `accept` again at once, and its select
+  is biased toward `accept`: a listener whose `accept` failed at once, every
+  time, kept it spinning (millions of retries a second) without polling the
+  open connections, and the task could not be aborted. Now:
+  - **`TransportError::Closed` ends accepting.** `serve` serves its open
+    connections to their end and then returns; a listener that never closes
+    keeps it running, as before.
+  - **The `accept` after any other error yields once first**, so the open
+    connections get their turn and the task stays cancellable. Listeners no
+    longer need their own guard (`aimdb-embassy-adapter` dropped its yield).
+  - **Repeated failures are summarized.** The first failure of a series is
+    logged with its error, then a summary at 10, 100, 1000, … attempts in a
+    row, and the next success logs how long the series was.
+
+  A listener whose `accept` keeps failing still retries without a pause:
+  `serve` is timer-free. Tokio's UDS and TCP listeners do not spin on a
+  persistent error such as `EMFILE`: their readiness is edge-triggered, so
+  they wait for the next connection attempt.
+
+- **Every client on a serial line gets its events, not every other one (#328).**
+  A UART never closes, so the AimX session engine saw every client behind it
+  as one session: a departed client's subscriptions kept streaming and held
+  their buffer subscriber slots, and the next client's subscribe collided with
+  them by id. Three changes in `run_session`:
+  - **A second handshake starts a new session.** `Session::starts_session`
+    (new, default `false`; `AimxSession`: `hello`) names a client's handshake.
+    When one arrives on a connection that already had one, the engine drops
+    every subscription pump (releasing its buffer subscriber), discards their
+    queued events and opens a fresh session before answering. This applies
+    to every transport; elsewhere a second `hello` on one connection does not
+    happen with a well-behaved client.
+  - **An ended pump only removes its own subscription.** Subscriptions carry
+    a generation, so a pump ending late (after `unsub`, then `sub` with the
+    same id) no longer cancels the newer subscription. A `sub` whose id is
+    still live is refused with `Denied` instead of silently replacing it.
+  - **A subscription whose stream ends on its own is reported.** When its
+    source closes, or never opened (an Embassy SPMC ring with no subscriber
+    slot left), the client gets the remaining events and then an `Internal`
+    error under the subscribe id, which it turns into a terminal error,
+    instead of an acknowledged subscription that never delivers. An
+    unsubscribed subscription, or the previous client's after a new
+    handshake, still ends in silence.
+
+  A client that leaves without another one connecting is still invisible:
+  its subscriptions run until the next handshake, since the engine has no
+  timer to detect a silent peer.
+
+## [2.0.0] - 2026-09-18
+
+### Added
+
+- **`ByteStream::split`, with `ByteRead` / `ByteWrite`.**
+  Borrows a stream into independently usable read and write halves, so a
+  session can run a reader and a writer concurrently in one `select` — which a
+  single `&mut` stream cannot express at all. Borrowed halves are enough: both
+  live in the same stack frame, which is why this needs nothing owned or
+  `'static` and why the objection design 052 recorded against `connector-io`
+  does not apply. `read`/`write_all`/`flush` stay for the handshake and for
+  callers that never split. The MQTT connector's event-driven session is the
+  first consumer; the Embassy and Tokio adapters implement it.
+- **The cancellation contract is written down.** `read` is
+  cancel-safe on both adapters AimDB ships — dropping the future consumes
+  nothing, verified per layer and end to end over a drip transport — but that
+  is documented as a property of those transports rather than a promise of the
+  trait, so a reader that cannot resume mid-packet is still free to implement
+  it. `write_all` is cancel-safe **nowhere** and must never sit in a `select`
+  arm: a partial write desynchronises the framing above it with nothing to
+  resync on.
+
+- **Runtime-neutral I/O layer (`session::io`, feature `connector-session`).**
+  `ByteStream`/`StreamDialer`/`StreamListener`/`Datagram`/`DatagramBinder`/`Delay`
+  sit below `Connection`, so an adapter owns sockets and clocks while a connector
+  owns framing. `FramedConnection` plus `FramingDialer`/`FramingListener` lift a
+  byte stream into the existing `Dialer`/`Listener`, and `OneShot<T>` is a
+  `Send + Sync` cell for moved-in resources with no `unsafe`. `Framer` reports a
+  failure as a `FrameFault`: `Recoverable` (skip the run and resync, what a
+  self-delimiting format such as COBS can do) or `Fatal` (close, what a length
+  prefix must do, having no delimiter to resync on). `encode` returns
+  `Result<(), FrameFault>` for the same reason, so a frame the framer refuses
+  reaches the caller as `TransportError::Framing` rather than a silent `Ok`.
+  `TransportError` also gains `Busy`, for a transport whose one endpoint
+  resource is already in use — distinguishable from `Io`, and retried like it.
+- **`session::endpoint` — the `host:port` grammar, in one place.**
+  `split_host_port_opt` / `split_host_port` and `EndpointError`, moved up from
+  `aimdb-tcp-connector` because more than one crate needs them and they do not
+  all depend on each other: `aimdb-client` resolves `tcp://` URLs whether or not
+  that connector is compiled in, so it had grown a 56-line copy of the same
+  grammar. `_opt` reports whether a port was written at all, so one caller can
+  default it while another rejects an endpoint that omits it.
+- **A panic is a bug, not an error channel — checked.** The crate is compiled
+  under `deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)` outside
+  its own tests. Four sites fixed: poisoned-mutex recovery in the
+  `record_id` and `typed_record` lock helpers, an `unwrap` under a `len()` check
+  in `record_origin`, and an `expect` on the AimX drain path. The rest carry an
+  `allow` with a reason.
+- **`log_trace!`.** The fifth facade macro, completing the set both destinations
+  support. Added for a KNX call site that was `tracing::trace!` before design
+  050 §10.5 moved it onto the facade.
+
+### Changed
+
+- **`::tracing` is reached through `$crate::__private`,** as `log` already was.
+  A crate using the `log_*` macros now declares neither `tracing` nor `log` as a
+  dependency of its own — only the matching feature, which cannot be delegated:
+  a `#[cfg]` inside a `#[macro_export]`ed macro is resolved where it expands.
+  Non-breaking; a crate that still declares `dep:tracing` is unaffected.
+
+### Added
+
+- **Design 050: an optional `log` feature, a second destination for the `log_*`
+  facade.** With it on, every facade call site also emits a `log` record; with it
+  off (the default, and every MCU build) the expansion is what it was. It exists
+  for a host that cannot be handed a process-global `tracing` subscriber —
+  chiefly an FFI layer loaded into a non-Rust process, which needs its
+  callback's context pointer to travel *with* the callback. A `log::Log` impl is
+  an ordinary value, so the context lives inside the destination instead of in a
+  static of the binding's own; `set_logger` also decides first-wins once, in
+  Rust, for every binding. `tracing` stays the default and the recommendation for
+  Rust consumers, and both may be enabled at once. Events arrive with
+  `Record::target()` set to the emitting module (`aimdb_core::builder`), the same
+  string a subscriber has always seen. See the crate docs for what a destination
+  must guarantee — the reentrancy rule is stricter than it was under `tracing`,
+  which has a guard `log` does not — and for the three bridges that can deliver
+  an event twice to a process that installed only one destination.
+- **`aimdb_core::__private`, hidden and unstable.** Re-exports the `log` crate so
+  a crate expanding the facade needs the `log` *feature* but not the
+  *dependency*. Not public API.
+
+- **`DbError::kind()` and `DbErrorKind`.** Eight action-shaped kinds — `Retry`,
+  `Lagged`, `Closed`, `Transport`, `Data`, `Configuration`, `Usage`, `Internal` —
+  so a caller can decide what to do without matching ~20 variants. The match in
+  `kind()` is exhaustive inside this crate, so a variant added later is a compile
+  error here rather than a silent reclassification at every downstream wildcard.
+
+### Changed (breaking)
+
+- **`DbError` is `#[non_exhaustive]`.** Downstream exhaustive matches now need a
+  wildcard arm; match on `kind()` instead where you only need to know what to do
+  about the failure. No in-tree match required a change. This is what makes every
+  future `DbError` variant additive.
+
+### Documentation
+
+- **`RecordMetadata` states that liveness is an observability extra.** A
+  `record.list` reply enumerates *registered* records, so a server registering a
+  fixed pool lists the whole pool. `produced_count` is what distinguishes live
+  from idle, and it is `observability`-gated by design — so a server whose
+  clients need that distinction must be built with `observability` on.
+- **`RecordMetadata.entity` no longer over-promises.** It claimed clients should
+  use it "instead of parsing keys", but it is the key's *leaf* segment:
+  `"station.17.temperature"` yields `"temperature"`, not `"17"`. No behavior
+  change.
+
+### Changed (breaking) — Design 047: one protocol (AimX) for every transport
+
+- **Wildcard / multi-record subscribe.** `Inbound::Subscribe` topics may carry
+  MQTT-style wildcards (`#`, `*`): `AimxDispatch` matches the pattern against
+  the registry once at subscribe time (the record set is builder-frozen),
+  merges the matched records' update streams under the one subscription id,
+  and emits one late-join `Snapshot` per matched record. The matcher moved in
+  from the retired `aimdb-ws-protocol` crate as
+  `session::topic_match::{topic_matches, is_wildcard}` (re-exported at the
+  crate root), alongside a new `pattern_contains(grant, requested)` — pattern
+  *containment* (grant's match set ⊇ requested's), the check an ACL needs when
+  the requested subscription is itself a wildcard (see the WS connector's
+  subscribe-ACL fix).
+- **AimX version handshake.** New `remote::{VERSION_PARAM, ws_url_with_version}`
+  carry the WS upgrade-URL version contract (`?v=3.0`) that the WS server gates
+  on; `version_compatible` is now also re-exported from `remote` for reuse by
+  transports that check the version out-of-band.
+- **Subscription streams carry the firing record.** `Session::subscribe` and
+  `ClientHandle::subscribe` now yield `SubUpdate { topic: Option<Arc<str>>,
+  data: Payload }` instead of bare `Payload`; `Outbound::Event` gains an
+  optional `topic` and `Outbound::Snapshot` gains the routing `sub` (frames
+  without them are unchanged on the wire). `Session::snapshot` became
+  `Session::snapshots(topic) -> Vec<(String, Payload)>` (one per covered
+  record).
+- **Late-join snapshots are sequence-numbered, terminated, and no longer lost
+  silently.** `Outbound::Snapshot` gains a required `seq` in the *same* space as
+  the subscription's events (`run_session` numbers the burst `1..=N`,
+  `pump_subscription` continues at `N + 1`) plus a `last` flag on the burst's
+  final frame. The client demux routes snapshots through the identical gap
+  accounting as events, so one that overruns the consumer's
+  `SUBSCRIBE_CHANNEL_CAP`-bounded sink is reported as `SubUpdate::skipped`.
+  Previously the client discarded the snapshot `try_send` result and snapshots
+  carried no `seq`, so a wildcard subscription over more than 256 matched
+  records silently delivered only 256, with no error and no gap — quietly
+  breaking "one snapshot per matched record".
+
+  Because a gap only reaches a subscriber on an update that is *actually
+  delivered*, mid-burst snapshots now stop one slot short of filling the sink,
+  reserving it for the flagged final snapshot — which therefore survives an
+  overrun, arriving as the single update with the new `SubUpdate::snapshot_end`
+  set and carrying the burst's whole loss count. A subscriber can tell a
+  complete initial state from a truncated one the moment the burst ends, without
+  waiting for a live event that a *static* subscription may never produce.
+
+  The flag is not an unconditional promise, so do not *block* on it: it rides
+  the final snapshot's frame and is lost with it if that frame fails to encode
+  or is rejected as malformed, and a `topic` matching no records emits no burst
+  at all. Loss accounting survives all of these — only the end-of-burst signal
+  goes missing.
+
+  Also fixes two smaller leaks on that path: a snapshot dropped by an encode
+  failure is now counted as loss (and logged, rather than skipped in silence),
+  and a snapshot for a subscription whose receiver is gone now prunes the sub
+  instead of lingering.
+
+  Wire: `snap` frames carry `"seq"` (one without it is `Malformed`) and the
+  burst's last frame adds `"last":true`; mid-burst frames are byte-identical to
+  before. API: `SubUpdate` gains the `snapshot_end` field and a
+  `with_snapshot_end()` builder.
+- **`AimxCodec` learned the `subscribed` ack frame** (`{"t":"subscribed",
+  "sub":S}`) for servers running `acks_subscribe:true` (the WebSocket
+  connector); UDS/serial/TCP keep the implicit ack. A dedicated `AimxCodec`
+  roundtrip suite now locks the frame set.
+- **`ClientConfig::topic_routed_subs` removed** — it existed solely for the
+  retired ws wire; all subscriptions are id-routed.
+- **Shared query/list vocabulary.** New `remote::QueryRecord { topic, payload,
+  ts }` is the canonical `record.query` result row (result shape
+  `{records, total}`); `RecordMetadata` gains optional `schema_type` /
+  `entity` fields (`entity` derived from the record key's final `.` segment).
+  New `remote::QUERY_ALL_PATTERN` (`"#"`) is the pattern a `record.query` with
+  no `name` resolves to, shared by every transport's dispatch so one request
+  cannot mean different record sets on different links. The generic
+  `AimxDispatch` previously defaulted to `"*"`, which under the MQTT grammar
+  spans exactly one dot-separated segment — so the same name-less query
+  returned every record over WebSocket but silently omitted nested ones over
+  UDS/serial/TCP.
+- **`ClientConfig::max_offline_queue` is now the command channel's capacity.**
+  The channel is `async_channel::bounded` and `enqueue` uses `force_send`, so a
+  full channel evicts its oldest and the bound holds across cloned
+  `ClientHandle`s without an admission lock. Default `usize::MAX` → **256**,
+  clamped to `1..=8192`: the ring is preallocated, so zero could never deliver
+  and `usize::MAX` would abort rather than mean "unbounded". An evicted `call`
+  resolves `RpcError::Internal`; an evicted `subscribe` ends its stream.
+  A cancellation is never the command evicted to make room: `CancelOnDrop` uses
+  a plain `try_send`, so abandoning a call cannot displace a caller's queued
+  `Write`.
+- **An evicted `CancelCall` no longer re-opens the pending-call leak.** Making
+  the channel evict-oldest put cancellation on the same lossy footing as data,
+  and `enqueue` discarded the evictee unexamined — so a `Write` behind a queued
+  cancellation could displace it, stranding that call's entry until the
+  connection ended (the leak cancel-safety exists to close, below in *Fixed*).
+  A lost cancellation now degrades to a *prune* signal and the engine reclaims
+  by inspection (`oneshot::Sender::is_canceled` identifies the abandoned set
+  exactly). The sweep is idempotent, so one signal covers any number of losses;
+  it is `O(N)` but reached only from the eviction path, leaving `O(1)` by-id
+  removal as the common case.
+
+### Performance
+
+- **Subscribe path carries JSON bytes, not a `serde_json::Value` tree.**
+  `stream_record_updates` now reads owned JSON bytes (`recv_json_bytes`) and
+  yields `(Payload, u64)`, so a record update flows buffer → wire without the
+  parse-into-`Value`-then-re-serialize round-trip the dispatch layer used to
+  pay per update (removing the intermediate `serde_json::Value`).
+  The `remote_json` subscription-event benchmark measures the direct-bytes path
+  at ~2× the throughput of the former tree path. No wire or API change — the
+  `skipped` loss signal still rides each `SubUpdate`.
+
+### Added
+
+- **Issue #196 — direct JSON bytes for type-erased remote reads.** The public
+  `RemoteSerialize`, `JsonCodec<T>`, `JsonRecordAccess` and
+  `JsonBufferReader` traits gain defaulted byte methods, preserving existing
+  manual implementations; the blanket Serde codec overrides them with direct
+  `to_vec`/`from_slice`. State `record.get` and subscription events now pass
+  owned JSON bytes into the existing opaque `Payload`/`RawValue` AimX path
+  without materializing an intermediate record `serde_json::Value`.
+  `RecordValue::as_json`, value-based APIs, custom codecs, AimX v2, ring-drain
+  fallback, write safety, lag/cancellation/backpressure behavior and
+  `no_std + alloc` remain unchanged. Focused production-boundary benchmarks
+  reduce allocation calls from 16 to 6 per reply/event; Criterion slope point
+  estimates show a 1.55x–1.61x in-memory record-to-envelope speedup on the
+  measured host.
+- **Issue #177 — bounded into-slice serialization for outbound links.** New
+  `OutboundConnectorBuilder::with_serializer_into` and the additive
+  `SerializedReader::recv_into`/`SerializedPayload` SPI let a fused typed reader
+  encode into caller-owned storage using the existing `SerializeError` contract.
+  `pump_sink` allocates one bounded scratch buffer per route and reuses it across
+  messages; an undersized buffer falls back to the existing owned serializer for
+  that value. Existing serializers, third-party `SerializedReader`
+  implementations, and `pump_client` keep their owned-`Vec` behavior. This
+  removes the codec allocation when an into-slice encoder is installed;
+  connector adapters may still copy the borrowed payload.
+- **Scratch serializer reset hook.**
+  `OutboundConnectorBuilder::clear_serializer_into` lets higher-level builder
+  extensions replace a bounded serialization strategy with an owned-only one
+  without retaining the previous route-local scratch callback.
+- **`RecordRegistrar::signal_gauge(name, unit) -> SignalGaugeHandle`** (design 041 §3.2) — the core hook behind `aimdb-data-contracts`'s `Observable::observe()`. Feeding values via `SignalGaugeHandle::update(f64)` folds them into per-record `SignalStats` (last/min/max/mean), surfaced through `RecordMetadata::signal_stats` on `record.list`/`record.get`. Mirrors the `with_name` precedent: always callable, an inert no-op handle when the `observability` feature is off, so callers never `#[cfg]` on core's features. New public types: `SignalGaugeHandle` (always available), `SignalStats`/`SignalGauge`/`SignalStatsInfo` (feature `observability`).
+
+### Fixed
+
+- **A peer's `seq` can no longer crash the client demux or invent a gap (`run_client`).** Subscription loss accounting computed `seq - (last_seq + 1)`, and `seq` arrives off the wire unvalidated. Two consequences: after an update with `seq == u64::MAX`, the *next* frame overflowed `last_seq + 1` — a debug-build panic, a wrapped nonsense gap in release — so one crafted frame was enough to take down a debug client. And a repeated or reordered `seq` rewound the cursor to the lower value, making the following valid frame report a gap that never happened (seq `1, 3, 2, 4` reported a phantom loss on the `4`). The arithmetic now saturates and the cursor only ever advances; an out-of-order frame is still delivered — dropping it would discard data over a number — but cannot rewind. Everything downstream of `SubUpdate::skipped` is affected: the CLI's `watch` warnings, `WsBridge`'s `onGap`/`droppedUpdates()`, and any `aimdb-client` subscriber.
+- **A non-terminal `#` no longer matches everything after it (`topic_matches`, `pattern_contains`).** Both walks returned `true` the moment they saw a `#`, so every segment following it was dead text: `topic_matches("a.#.secret", "a.public")` and `pattern_contains("a.#.secret", "a.public")` were both `true`, despite the module documenting `#` as usable at any position. On the ACL path this widened coverage — a `Permissions::can_subscribe` grant of that shape behaved like a blanket `a.#` grant over the whole subtree. `#` now absorbs **zero or more** segments with the pattern continuing afterwards (RabbitMQ topic-exchange semantics, as documented), so `a.#.secret` matches `a.secret` and `a.b.secret` but not `a.public`. Both functions share one greedy walk that retains a single `#` backtrack point, bounding it at `O(|pattern| · |subject|)` — relevant because `pattern_contains`'s subject is the client-supplied subscription pattern. Grants and subscriptions using a trailing `#` (`a.#`, `#`) or `*` are unaffected; the change only ever tightens what an interior `#` admits.
+- **AimX protocol doc rot cleaned up; `remote::PROTOCOL_VERSION` corrected to `"2.0"` and exported.** The `remote` module docs claimed "AimX v1" and linked a spec file that no longer exists; they now describe the v2 NDJSON tagged-frame wire and point at `crate::session::aimx` / `docs/design/remote-access-via-connectors.md`. The AimX dispatch's Welcome uses the constant instead of a hardcoded `"2.0"` (same bytes on the wire). The dead, never-exported v1 `Message` untagged envelope and its helpers were removed from `remote::protocol`. Also de-advertised Kafka/HTTP connector semantics from `ConnectorUrl` docs (the parser is scheme-agnostic; those connectors never existed) and updated the `connector` module docs from the removed `.link()` API to `.link_to()`/`.link_from()`.
+- **An abandoned RPC call no longer leaks its pending-call entry (`run_client`).** Dropping a `ClientHandle::call` future — a timeout losing the race, an aborted task — dropped only the caller's `oneshot::Receiver`, which the engine could not observe: a peer that holds the connection open while never answering produces neither a `Reply` nor a disconnect, the only two things that removed an entry. The demux map therefore grew by one live `oneshot::Sender` per timed-out request for the life of the connection — the shape `aimdb-wasm-adapter`'s `query_timeout_ms` produces, and unbounded for a long-lived link against an unresponsive peer. `ClientHandle::call` is now **cancel-safe**: the dropped future emits an internal `CancelCall` naming its own request, and the engine frees the entry by id in `O(1)`. Reclamation is exact and immediate — it needs no later call, no keepalive tick (the fix holds with `keepalive_interval: None`), and no scan of the table, so a concurrent batch of timeouts costs `O(N)`, not `O(N²)`. A call abandoned while its command is still queued is additionally never dialed out: no wire request is spent on a reply nobody awaits.
+
+  To make that race-free, correlation ids move from the engine to `ClientHandle`: the id exists before the command is queued, so the cancellation that follows it on the same FIFO channel always names an entry the engine has already created (with engine-assigned ids there is a window in which the caller gives up before learning its id and has nothing to name). Calls and subscriptions draw from one shared `AtomicUsize` — `usize` rather than `u64` because 64-bit atomics are not native on every supported MCU (thumbv7em), which only bounds how many ids one process can issue, all of them JSON-safe. Wire-visible consequence: ids are **monotonic across reconnects** instead of restarting at `1` per connection, so a redial never reuses an id (`0` stays free as a "no correlation" sentinel). No protocol change — cancellation is engine-internal and the server is never asked to abandon in-flight work.
+- **`build()` reports a missing runtime alongside every other configuration error (issue #133 contract).** The missing-runtime check no longer short-circuits: it is collected as a `ConfigError` and returned in the one `DbError::InvalidConfiguration` with all other findings (previously the collected errors were silently dropped and only a `RuntimeError` surfaced). The error type for a runtime-less build changes accordingly from `DbError::RuntimeError` to `DbError::InvalidConfiguration`.
+
+### Changed (breaking)
+
+- **Design 037 W8 — zero-allocation consume path: `BufferReader` is now poll-based ([design doc](../docs/design/037-zero-alloc-consume-path.md)).** The object-erased async `recv` returned a `Pin<Box<dyn Future>>`, heap-allocating on every call — the last AimDB-added per-message allocation on the consume path. It is replaced by an object-safe poll method, restoring async ergonomics through a new handle:
+  - **SPI break (adapter authors only):** `BufferReader<T>::recv(&mut self) -> Pin<Box<dyn Future>>` → `BufferReader<T>::poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, DbError>>`. `try_recv` is unchanged. Same break for the `remote-access` `JsonBufferReader`: `recv_json` → `poll_recv_json`. Object safety is preserved (poll, unlike `async fn`, is object-safe).
+  - **New consumer handles:** `buffer::Reader<T>` (and `buffer::JsonReader` under `remote-access`) wrap the erased reader and expose an `async fn recv()` implemented once via `core::future::poll_fn` — `core`-only, `no_std`-clean, zero-allocation, no `unsafe`. `Consumer::subscribe`, `TypedRecord::subscribe`, and `AimDb::subscribe` now return `Reader<T>` instead of `Box<dyn BufferReader<T> + Send>`.
+  - **Source-compatible for consumers:** `subscribe().recv().await` is unchanged at every call site; examples and aimdb-pro compile without edits. Holders of a concrete adapter reader wrap it once: `Reader::new(Box::new(reader))`.
+  - **Connector SPI unchanged (BYOC-stable, design 039 §2):** `SerializedReader::recv` keeps its boxed `RecvSerializedFuture`; only the *inner* per-message box is eliminated. The remote-access JSON path drops both its boxes (`poll_recv_json` + `JsonReader`).
+  - **Result:** **0 AimDB-added heap allocations per message** on the in-process consume path, enforced by the `aimdb-bench` B0 suite (1 → 0 allocs/msg across all three tokio buffer profiles). Tokio `broadcast`/`watch` expose no public poll API, so the reader round-trips its receiver through a single reused `tokio_util::sync::ReusableBoxFuture` — one allocation per subscriber lifetime, not per message — and the Mailbox replaces `Notify` with an explicit waker list beside the slot. Embassy drives embassy-sync's public poll methods directly (`Subscriber::poll_next_message`, `watch::Receiver::poll_changed`, `Channel::poll_receive`) — no future box and **no new `unsafe`**; `poll_next_message`/`poll_changed` were added to the vendored `embassy-sync` as small additive wrappers (upstream PR pending).
+
+- **Design 036 W1 — data-plane de-`Any`: the per-message `Box<dyn Any>` is gone from the connector SPI ([design doc §W1](../docs/design/036-followup-refactoring.md)).** Both ends of every erased hop were typed — `T` is known in the registrar where routes are wired, and the connector spine only wants bytes — so the typed pipeline is now built inside closures at registration time (`finish()`) and the SPI exposes only the wire level. The full break inventory:
+  - **Inbound:** new `IngestFn = Arc<dyn Fn(&RuntimeContext, &[u8]) -> Result<(), String>>` + `IngestFactoryFn` replace deserializer + producer: deserialize + produce in one typed closure, **synchronous** (`Producer::produce` is sync + infallible per design 029 — the per-message `Box::pin` disappears along with the `Box<dyn Any>`). Deleted: `ProducerTrait`/`produce_any`, `ProducerFactoryFn`, `DeserializerFn`/`ContextDeserializerFn`/`DeserializerKind`, `TypedRecord::create_producer_trait`. `InboundConnectorLink` is `{ url, config, ingest_factory, topic_resolver }` (factory non-optional — `finish()` validates the deserializer before registering, error strings unchanged); `collect_inbound_routes` returns `Vec<(String, IngestFn)>`; `Route` is `{ resource_id, ingest }`.
+  - **`Router::route` is a sync fn and its context is mandatory:** `route(&self, resource_id, payload, ctx: &RuntimeContext) -> Result<(), String>` (was `async` with `Option<&RuntimeContext>`). Every production caller already passed `Some(&ctx)`; the old "skip context-deserializers when no ctx" branch is unrepresentable now that raw-vs-context is invisible inside the fused closure.
+  - **Outbound:** new `SerializedSource` (object-safe `subscribe()`, sync — the buffer handle is pre-resolved) → `SerializedReader` whose `recv(&mut self, ctx: &RuntimeContext)` yields `SerializedValue { dest, payload }` — subscribe → recv → resolve topic → serialize all typed inside, including the third erasure crossing the old path had: `topic_any(&dyn Any)` per value. Deleted: `ConsumerTrait`/`subscribe_any`, `AnyReader`/`recv_any`, `ConsumerFactoryFn`, `SerializerFn`/`ContextSerializerFn`/`SerializerKind`, `TopicProviderAny`/`TopicProviderWrapper`/`TopicProviderFn` (the typed `TopicProvider<T>` is stored as `Arc<dyn TopicProvider<T>>` directly). `ConnectorLink` is `{ url, config, source_factory }` (non-optional, same validation contract); `OutboundRoute` is `{ topic, source, config }` and the "skip links without serializer" branch in `collect_outbound_routes` is gone.
+  - **Error contract of the fused reader:** buffer errors propagate unchanged (`BufferLagged` → pumps skip the gap; anything else → publisher stops, identical control flow). Serialization failures are logged and skipped *inside* the reader — observably the same as the old pump-side `continue`, but the log line moves (now `outbound link: failed to serialize <type> (dest …)` instead of `pump_sink: failed to serialize …`).
+  - **Unrepresentable error surface deleted:** `SerializeError::TypeMismatch` (both constructors died with the downcasts; `DbError::TypeMismatch` is unrelated and stays). Dead code deleted: `ConnectorClient` (held `Arc<dyn Any>`, zero users) and `OutboundConnectorLink`.
+  - **Source-compatible:** the registrar API (`with_serializer`/`with_serializer_raw`/`with_deserializer`/`with_deserializer_raw`/`with_topic_provider`/`with_topic_resolver`, `link_to`/`link_from`) keeps identical signatures — examples, codegen output, and aimdb-pro compile unchanged. The `RuntimeContext` is threaded into `recv`/ingest per call (not captured) for the design-026 context (de)serializers; raw variants skip the per-message ctx clone.
+  - **Deliberate exception:** `JoinTrigger` keeps its `Box<dyn Any + Send>` — a join fans N differently-typed inputs into one channel and user closures branch via `as_input::<T>()`; the erasure is the public API there (documented on the type). Remaining `dyn Any` in core after W1: `ExtensionMap` (TypeId-keyed), `AnyRecord::as_any`/`as_any_mut` + `DynBuffer::as_any` (setup-time), and join.
+
+- **Phase 3 — `R` removed from the object graph (Issue #131, [design doc §3.2/§3.3](../docs/design/034-technical-debt-review.md)).** The runtime travels as `Arc<dyn aimdb_executor::RuntimeOps>`; records (`T`) are the only generic surface left. `AimDb`, `AimDbBuilder` (no `NoRuntime` typestate), `TypedRecord<T>`, `RecordRegistrar<'a, T>`, `TransformBuilder<I, O>`, `JoinBuilder<O>`, `RecordT`, and `ConnectorBuilder` are all non-generic over the runtime; `RuntimeContext` is a concrete struct (`time().now()` → `u64` nanos, `sleep(core::time::Duration)` + `sleep_millis`/`sleep_secs`; `millis`/`secs`/`micros`/`duration_since`/`duration_as_nanos`/`extract_from_any` deleted). `source`/`tap`/`transform`/`transform_join` are inherent registrar methods (the `*_raw` variants and `ext_macros.rs` are deleted); connector consumer/producer factories take `&AimDb` (the `Arc<dyn Any>` downcast-or-panic dance is gone); context (de)serializers and `Router::route` receive the concrete `RuntimeContext`; `runtime_arc()` → `runtime_ops()` (+ new `runtime_ctx()`), `runtime_any()` and the borrowed `runtime()` accessor deleted (zero callers; `&*db.runtime_ops()` covers the borrowed flavor — [follow-up doc §2.5](../docs/design/035-review-followups-deferred.md)); `on_start` closures receive `RuntimeContext`; the `RuntimeForProfiling` marker is deleted (profiling clocks ride `RuntimeOps::now_nanos`); the session client engine clock is `Arc<dyn RuntimeOps>`. Multi-input join fan-in is one bounded `async-channel` queue in core (capacity 64 on `std` and wasm32 — matching the old tokio/WASM queues — and 16 on embedded `no_std`, up from Embassy's 8). **Close semantics changed on Embassy:** the queue now closes on *all* runtimes once every input forwarder exits, so a `no_std` join handler's `while let Ok(_) = rx.recv().await` loop ends instead of parking forever — treat `Err(QueueClosed)` as end-of-inputs. Input forwarders skip `BufferLagged` (SPMC-ring overflow) and keep forwarding, the same recoverable-lag policy as every other recv loop in core. The `JoinFanInRuntime` GAT family is gone from `aimdb-executor`.
+
+- **Generic runtime trait re-exports removed from the crate root (Issue #131 follow-up).** `aimdb_core::{RuntimeAdapter, Runtime, TimeOps, Logger, RuntimeInfo}` are gone — core no longer consumes the generic family (the runtime travels as `Arc<dyn aimdb_executor::RuntimeOps>`), and keeping the re-exports invited `R:`-bounds back into downstream signatures. Import them from `aimdb_executor` directly where an adapter still implements them; `ExecutorError`/`ExecutorResult` stay re-exported.
+
+### Changed
+
+- **Session client keepalive is deadline-based.** Activity records a timestamp (one dyn clock read) and the boxed `RuntimeOps::sleep` future stays armed for a full idle window — re-created about once per keepalive interval instead of once per processed frame/command (each re-arm previously heap-allocated through the `dyn RuntimeOps` boundary). Wire behavior unchanged: a Ping still goes out once the link has been idle for `keepalive_interval` ms.
+- **`RecordRegistrar::source` closure bound relaxed: `Send + Sync` → `Send`.** The `FnOnce` is taken out of its slot exactly once, so `Sync` bought nothing (it was an artifact of the deleted `ext_macros.rs`); source closures may now capture `!Sync` state (e.g. `Cell`-based sensor state). `tap` already required only `Send`.
+
+### Added
+
+- **`connector-session` feature + `session` module — the shared, runtime-neutral session substrate (Issue #39, [design doc](../docs/design/remote-access-via-connectors.md)).** A new `crate::session` module (gated `connector-session`, `no_std + alloc`, also enabled transitively by `std`) carrying the connector-convergence machinery:
+  - **Substrate traits** — `Connection`/`Listener`/`Dialer` (Layer 1 transport, framing-in-transport), `EnvelopeCodec` (Layer 2, symmetric: `decode`/`encode` + the client-direction `encode_inbound`/`decode_outbound`), and `Dispatch` (shared, `Send + Sync`) + `Session` (per-connection, `&mut`-threaded) for Layer 3. Plus the role-neutral `Inbound`/`Outbound` message set, `Payload = Arc<[u8]>` (raw bytes — one serde pass on hot paths), `PeerInfo`/`SessionCtx` (type-erased auth `ext` slots), `Source`, and the `SessionLimits`/`Transport`/`Codec`/`Rpc`/`Auth` error enums. All `dyn`-safe on `std` and `no_std + alloc`.
+  - **Server engine** — `serve` (accept loop, honors `SessionLimits::max_connections`) + `run_session` (per-connection biased `select_biased!` loop: RPC + streaming subscriptions funneled through a bounded per-connection event channel + fire-and-forget writes). Spawn-free (one `FuturesUnordered` per engine future); honors `SessionLimits::max_subs_per_connection`, with subscriptions reaped — and their cap slot freed — when a stream ends or on Unsubscribe. `SessionConfig` knobs: `reads_hello`, `acks_subscribe`.
+  - **Client engine** — `run_client` returns a cheap-clone `ClientHandle` (`call`/`subscribe`/`write`) + the engine future; demuxes replies by `id`, supports id- or topic-routed subscriptions, exponential reconnect backoff, idle keepalive, and a bounded offline command queue (`ClientConfig`). The only runtime dependency is the adapter's `TimeOps` clock; everything else is `futures` channels + `async-channel`.
+  - **Data-plane toolkit** — `pump_sink` (outbound: consume-serialize-publish via `Connector`) and `pump_source` (inbound: one multiplexed `Source` reader → `Router` fan-out), extracting the boilerplate every data-plane connector hand-rolled.
+  - **Generic connectors** — `SessionClientConnector<D, C>` and `SessionServerConnector<C, LF, DF>` wrap the engines onto the `ConnectorBuilder` spine so a transport crate contributes only its `Dialer`/`Listener`/`Connection` triple under a configurable scheme (default `"remote"`).
+- **`session::aimx` — the AimX-v2 protocol substrate (gated `connector-session` + `json-serialize`).** `AimxCodec`, the symmetric NDJSON `EnvelopeCodec` (`no_std + alloc`; splices an already-serialized record-value `Payload` into the JSON envelope verbatim via `serde_json`'s `RawValue`, no re-escaping). `AimxDispatch`/`AimxSession` (`no_std + alloc` as of Issue #120 — gated `connector-session` + `remote-access`; it reaches into core's `record.list`/JSON API, de-std'd to match), porting the method semantics (`hello`, `record.{list,get,set,drain,query}`, `graph.*`, `*.reset`) off the deleted hand-rolled handler onto `Session`. The drain cursors live in the per-connection session; the AimX subscribe ack stays implicit (events carry the request id back).
+- **`remote-access` feature — the AimX server data model, now `no_std + alloc` (Issue #120, follow-up to #39).** New feature `remote-access = ["json-serialize", "thiserror"]` that lifts the AimX *server* path off the `std` gate so a board can **serve** a host (e.g. over serial), not just dial one. It re-gates, from `std` to `remote-access`: the `crate::remote` module (record metadata + introspection, the wire protocol/config/security/error types), the type-erased `AnyRecord` JSON + metadata methods (`collect_metadata` / `latest_json` / `subscribe_json` / `set_from_json`), the `JsonBufferReader` trait, and the `AimDb`/`AimDbInner` JSON read/write/subscribe API (`list_records` / `try_latest_as_json` / `set_record_from_json`). The server dispatch swaps `std::collections::HashMap`/`HashSet` → `hashbrown` and `std::sync::Arc` → `alloc::sync::Arc`; `thiserror` is pulled with `default-features = false` so `RemoteError` builds on `no_std`, and `From<std::io::Error> for RemoteError` is kept behind a `std` cfg. `std` enables `remote-access` transitively, so std builds are unaffected. Verified by `cargo check -p aimdb-core --no-default-features --features "alloc,connector-session,remote-access" --target thumbv7em-none-eabihf` (added to the Makefile `test-embedded` target alongside `alloc,remote-access` test/clippy lines).
+- **`AimDb::runtime_arc(&self) -> Arc<R>`.** An owned runtime-adapter handle for connectors that hand the runtime to a `'static` engine future (the session client engine clones it for its `TimeOps` clock).
+- **`ConnectorConfig::from_query(&[(String, String)])`.** Builds a per-route `ConnectorConfig` from a link URL's query pairs (`timeout_ms` lifted to the typed field, everything else passed through in `protocol_options`); the seam `pump_sink` uses to thread per-route config to `Connector::publish`.
+- **`json-serialize` feature + `codec` module (M16, Design 032).** New `crate::codec` module with `RemoteSerialize` (capability trait, blanket-impl'd for every `serde` `Serialize + DeserializeOwned` type), the object-safe `JsonCodec<T>` storage trait, and the zero-sized `SerdeJsonCodec`. All three are re-exported from the crate root. The feature is `no_std + alloc` compatible (`serde_json` runs on `alloc`), so `RecordValue::as_json()` now works on embedded targets, not just `std`. `std` enables `json-serialize` transitively, so existing std builds are unaffected.
+- **`DynBuffer::peek(&self) -> Option<T>` (M15, Design 031).** Non-destructive, buffer-native point-in-time read; the default impl returns `None` (correct for buffers with no canonical latest, e.g. broadcast/SPMC rings). AimX `record.get` and `TypedRecord::latest()` now route through it. Adapters implement it per buffer type — see the tokio/embassy adapter changelogs.
+- **`impl Dialer for Box<dyn Dialer>` (Issue #123).** A boxed dialer is itself a `Dialer`, so a runtime-selected `Box<dyn Dialer>` (e.g. from a `scheme://` URL resolver) can be handed straight to `run_client<D: Dialer>` without a generic transport at the call site.
+
+### Internal refactors
+
+- **Phase 2 — builder internals de-erased (Issue #130, [design doc §3.2](../docs/design/034-technical-debt-review.md)).** No behavior change: `AimDbBuilder` stores its per-record future collectors and `on_start` tasks as their typed forms (`Vec<(StringKey, SpawnFnType<R>)>` / `Vec<StartFnType<R>>`) instead of `Box<dyn Any + Send>` — the builder is already generic over `R`, so the erasure bought nothing. The panicking downcasts in `build()` (`"spawn function type mismatch"`, `"on_start fn type mismatch"`) are deleted. To keep the field types well-formed on the `NoRuntime` typestate, `AimDb<R>`'s struct-level `R: RuntimeAdapter + 'static` bound moved to its impl blocks (strictly more permissive). `BoxFuture` is now a re-export of the canonical alias in `aimdb-executor` (same type).
+
+- **Phase 1 mechanical cleanup (Issue #132, [design doc](../docs/design/034-technical-debt-review.md)).** No behavior change:
+  - All dual `#[cfg(feature = "std")] use std::… / #[cfg(not(…))] use alloc::…` import pairs replaced by single unconditional `use alloc::…` imports; redundant per-module `extern crate alloc;` declarations dropped (the crate root has one). The duplicated std/no_std `RuntimeContext` impl blocks in `context.rs` (character-identical except for the `Arc` path) are merged into one.
+  - New crate-private `log_debug!`/`log_info!`/`log_warn!`/`log_error!` macros (`src/log.rs`) forward to `tracing` when the feature is on and expand to an argument-borrowing no-op otherwise — deleting all 62 per-call-site `#[cfg(feature = "tracing")]` gates. `defmt` is deliberately not folded in (most sites use `{:?}` with non-`defmt::Format` types); router.rs keeps its paired explicit defmt gates.
+  - `build()` resolves each topo-order key with one O(1) `by_key.get_key_value(&str)` lookup (via `StringKey: Borrow<str>`) instead of an O(n) `keys().find()` scan plus a redundant second resolve.
+
+- **`RecordMetadataTracker` deleted; `TypedRecord` keeps only a bare `writable` flag (Issue #120).** The per-record tracker (an `Arc<Mutex<Option<timestamp>>>` + `Arc<AtomicBool>` + `SystemTime::now()` on every `produce()` via `RecordWriter::push`) is gone; the surviving `writable` bit is now a single `portable_atomic::AtomicBool` field on `TypedRecord`, and `collect_metadata` reads the type name + `writable` directly with no shared state. New `pub(crate)` `DbError::{runtime_error, permission_denied, record_key_not_found}` constructors let the JSON/remote paths write one error expression across `std` (message carried) and `no_std` (unit placeholder) — replacing the inline `#[cfg]` splits at each call site. The `graph` types' `serde` derives (`RecordOrigin` / `GraphNode` / `GraphEdge` / `EdgeType`) move from the `std` gate to the `serde` feature (always on with `alloc`), so `RecordMetadata` can serialize on `no_std`.
+
+- **AimX server/client ported onto the shared session engine; the hand-rolled loops deleted (Issue #39, [design doc](../docs/design/remote-access-via-connectors.md)).** Building on the spawn-free work below, `remote/handler.rs` (the per-connection `select!` loop) and `remote/supervisor.rs` (the accept loop) are **removed** — their behavior is now `run_session` + `serve` in `session`, driven by the AimX-v2 `AimxDispatch`/`AimxCodec`. `remote/stream.rs`'s `stream_record_updates` survives and is reused by `AimxSession::subscribe`. The UDS transport (socket bind/connect, NDJSON framing) relocated out of core into the new `aimdb-uds-connector` crate; core keeps only the protocol (codec + dispatch) and the generic session connectors. The query handler type-erasure moved to `remote/query.rs` (`QueryHandlerFn`/`QueryHandlerParams`). New dependencies: `async-channel` (runtime-neutral mpsc), `futures-channel` (oneshot), `futures-util`'s `async-await-macro` (`select_biased!`), and `serde_json`'s `raw_value` feature — all `no_std + alloc`-compatible, none entering the no_std contracts build.
+- **AimX remote-access path is now spawn-free (Issue #114, Design 030).** Every remaining `tokio::spawn` in `aimdb-core/src/remote/` was removed; the supervisor's accept loop and each connection handler now own their own `FuturesUnordered<BoxFuture>` driven by `tokio::select! { biased; }`. Cancellation collapsed to one mechanism — dropping the future.
+  - New `aimdb-core/src/remote/stream.rs` exports a `pub(crate) stream_record_updates` helper that adapts a record's `JsonBufferReader` into a `Stream<Item = serde_json::Value>` via `futures_util::stream::unfold`. No task, no channel — drop the stream to cancel.
+  - `AimDb::subscribe_record_updates` **deleted**. The method had no out-of-tree callers (the only caller was the AimX handler); replaced by `stream_record_updates` above.
+  - Per-subscription `oneshot::Sender<()>` cancel channels and the `SubscriptionHandle` struct **deleted**. `ConnectionState::subscriptions` is now `HashMap<String, Arc<tokio::sync::Notify>>`; `record.unsubscribe` calls `notify_one()`, waking the per-sub future immediately (even when parked on `stream.next()`).
+  - The two-task chain per subscription (buffer-reader task + JSON-event forwarder task) **collapsed** into one `run_subscription` future per subscription, held in the connection's `FuturesUnordered`.
+
+### Changed (breaking)
+
+- **Phase 2 — MQTT knobs deleted from the generic link builders; `ConnectorConfig` pruned (Issue #134, [design doc §3.6](../docs/design/034-technical-debt-review.md)).** `OutboundConnectorBuilder::with_qos`/`with_retain` and `InboundConnectorBuilder::with_qos` are gone — use `aimdb-mqtt-connector`'s `MqttLinkExt`/`MqttOutboundLinkExt` (same option keys, wire-identical) or the generic `with_config(key, value)`. `with_timeout_ms` survives with protocol-neutral docs. `ConnectorConfig` drops its typed `qos: u8`/`retain: bool` fields (verified unread by every connector — MQTT reads `protocol_options`) and the Kafka/HTTP/shmem interpretation docs; it keeps `timeout_ms` + `protocol_options`. `OutboundConnectorBuilder`/`InboundConnectorBuilder` are now re-exported from the crate root (for the extension-trait impls).
+
+- **Phase 2 — panic-free builder validation; `build()` collects every configuration mistake (Issue #133, [design doc §3.4](../docs/design/034-technical-debt-review.md)).** One failure model instead of two: builder methods stay infallible and never panic on user mistakes; `build()` performs all validation and returns one `DbError::InvalidConfiguration { errors: Vec<ConfigError> }` (new variant + new public `ConfigError { record_key, url, message }` type, error code `0x4003`) carrying **every** finding from the run. Specifics:
+  - `TypedRecord::set_producer`/`set_transform`/`add_inbound_connector` mutual-exclusion violations and duplicate producers/transforms: recorded, conflicting registration skipped (observable: `has_producer()` stays `false` after a conflicting `.source()`).
+  - `OutboundConnectorBuilder::finish()`/`InboundConnectorBuilder::finish()`: invalid URL, missing serializer/deserializer, unregistered scheme, and the transform/source conflicts are recorded with record key + URL; the link is not registered and the registrar is returned as usual.
+  - The spawn-time factory panics (missing buffer, record lookup) are now build()-time checks: any record with an outbound or inbound link and no buffer fails `build()` with key + link URL. Consequence: `.buffer()` may be called after `.link_to()`/`.link_from()` — the finish()-time buffer check is gone.
+  - `configure()` with a key already registered under a different type: recorded, the closure is skipped (previously `assert!`).
+  - Duplicate record keys and `DependencyGraph` findings (cycles, unregistered transform inputs) fold into the same `InvalidConfiguration` report — callers matching on `DuplicateRecordKey`/`CyclicDependency` from `build()` must update.
+  - Surviving `panic!`/`expect`s on the builder path are internal invariants only, worded "this is a bug in aimdb-core". `AnyRecord` gains `has_buffer()` and `drain_config_errors()` (breaking for external implementors).
+
+- **Phase 2 — `RecordRegistrar` fluent methods take fresh borrows (Issue #130, [design doc §3.5](../docs/design/034-technical-debt-review.md)).** The methods previously took `&'a mut self` and returned `&'a mut Self` with `'a` = the struct's own lifetime parameter, so the first call borrowed the registrar for its entire remaining lifetime and only one unbroken chain per `configure` closure was possible. Now:
+  - All fluent methods are `&mut self -> &mut Self`; separate statements (`reg.source_raw(…); reg.tap_raw(…);`) and registrar reuse after a chain work.
+  - `configure`'s closure bound is `FnOnce(&mut RecordRegistrar<'_, T, R>)` (HRTB dropped) — existing closures compile unchanged.
+  - `OutboundConnectorBuilder` / `InboundConnectorBuilder` are now `<'r, 'a, T, R>` (`'r` borrows the registrar, `'a` is the registrar's record borrow) instead of the double-`'a`; `finish()` returns `&'r mut RecordRegistrar<'a, T, R>`, so `.finish().link_from(…)` chains keep working.
+  - `RecordT::register` is `fn register(reg: &mut RecordRegistrar<'_, Self, R>, cfg: &Self::Config)` (was `fn register<'a>(reg: &'a mut RecordRegistrar<'a, …>)`); the `impl_record_registrar_ext!` macro and the adapter/persistence extension traits follow the same shape. Code that *names* the old signatures (custom `RecordT` impls, custom extension traits) must update; closure-based configuration is source-compatible.
+
+- **`DbError` unified on `alloc::string::String` — one shape per variant on every target (Issue #129, [design doc §3.1.1](../docs/design/034-technical-debt-review.md)).** The std/no_std dual-field design (`key: String` under `std`, `_key: ()` otherwise) is gone: every context field is a `String` unconditionally (the crate already requires `alloc` everywhere), and `Display`/`Error` derive from `thiserror` on every target (thiserror 2.x is no_std-capable, now a mandatory `default-features = false` dependency; the `remote-access` feature no longer lists it). Consequences:
+  - **no_std only:** field renames (`_endpoint`/`_reason`/`_buffer_name`/`_key`/… `: ()` → the real `String` fields); `Display` now prints the same full messages as std builds instead of the `Error 0xNNNN` numeric-code table (which is deleted); `DbError` now implements `core::error::Error`. `error_code()` / `error_category()` are unchanged.
+  - **std:** no change to variant shapes or messages.
+  - The helper constructors `DbError::runtime_error` / `permission_denied` / `record_key_not_found` are now **public**, un-gated from `remote-access`, single-bodied (the message is carried on every target), and joined by a new `DbError::missing_configuration`. Every dual `#[cfg]` construction branch in core, the adapters, and the MQTT/KNX connectors is collapsed.
+- **`ConsumerTrait::subscribe_any` is infallible (Issue #132).** The future now resolves to `Box<dyn AnyReader>` instead of `DbResult<Box<dyn AnyReader>>` — subscription has been infallible since M14 (pre-resolved buffer handle); the `Result` was kept only for caller compatibility. Implementors drop the `Ok(...)` wrap; callers drop the dead `Err` arm.
+- **`OutboundRoute` is a struct (Issue #132).** Was a 5-tuple type alias destructured positionally; now named fields: `topic`, `consumer`, `serializer`, `config`, `topic_provider`.
+- **The `std` feature no longer enables a `tokio` dependency (Issue #132).** Since the session-engine refactor (030/033) the only `tokio::` references in `aimdb-core/src` are in `#[cfg(test)]` modules and doc comments — covered by the dev-dependency. Core no longer pulls tokio (`net`, `io-util`, `sync`, `time`) into every std build; depend on tokio directly if you relied on the transitive dependency.
+
+- **`RecordMetadata` drops `created_at` / `last_update`; `AimxConfig.socket_path` is now `String` (Issue #120).** Part of de-std'ing the remote data model for the `no_std` AimX server. Core no longer keeps per-record timestamp state — the `std::sync::Mutex`-+-`SystemTime`-backed `RecordMetadataTracker` is deleted — so `RecordMetadata` loses the `created_at` and `last_update` fields, `RecordMetadata::new` loses its `created_at` parameter, and `with_last_update` / `with_last_update_opt` are removed. AimX `record.list` (and downstream MCP / CLI output derived from it) therefore no longer carry those two fields; every other metadata field is unchanged. `AimxConfig.socket_path` becomes `String` (was `PathBuf`) and `AimxConfig::socket_path(impl Into<String>)` replaces `impl Into<PathBuf>` — `&str` / `String` callers are unaffected, `&Path` / `PathBuf` callers must convert (the UDS transport in `aimdb-uds-connector` does the `Path`-based bind). `SecurityPolicy`'s writable set and the `remote` module's collections move from `std::collections` to `hashbrown`.
+
+- **`AimDbBuilder::with_remote_access(config)` removed (Issue #39).** Register a session connector instead: `.with_connector(aimdb_uds_connector::UdsServer::from_config(config))`. The connector binds its transport at `build` time (bind errors surface synchronously, as before), applies the security policy's writable-record marking, and drives the shared `serve` engine. The builder's private `remote_config` field is gone; the per-record `TypedRecord::with_remote_access()` is unrelated and unchanged. The reshaped **AimX-v2** wire is not backward-compatible with the legacy v1 framing.
+- **`latest_snapshot` removed from `TypedRecord`; `latest()` / AimX `record.get` read the buffer via `peek()` (M15, Design 031).** Eliminates one snapshot-mutex lock + `Option<T>` clone per `produce()` on the hot path. Behavioural consequences:
+  - A record configured with `.with_remote_access()` but **no buffer** now fails `build()` with a clear error (previously a silent runtime no-op — reads returned `not_found`, writes were discarded). Add a buffer, e.g. `.buffer(BufferCfg::SingleLatest)`.
+  - `record.get` / `latest()` on an `SpmcRing` record now returns `not_found` / `None` — a ring keeps per-consumer history with no canonical latest. Use `record.drain` (history) or `record.subscribe` (live). `SingleLatest` and `Mailbox` are unaffected.
+  - On `no_std`/embedded, `latest()` now depends on the adapter implementing `peek()` (the Embassy adapter does — see its changelog).
+- **`with_remote_access()` is now gated on `json-serialize` and bounded on `T: codec::RemoteSerialize` (M16, Design 032).** Same effective bound as before (`Serialize + DeserializeOwned`, blanket-impl'd), but the stored serializer/deserializer closures are replaced by a single type-erased `Arc<dyn JsonCodec<T>>`. `std` enables `json-serialize`, so std callers see no change; `no_std + alloc` callers must enable the `json-serialize` feature to call it.
+- **`producer_service` renamed to `producer` (M15).** `TypedRecord::set_producer_service` → `set_producer`, and `has_producer_service` → `has_producer` (the latter also on the `AnyRecord` trait). Affects code that called these methods directly; the public `.source()` registrar API is unchanged. Also collapses the std/no_std `cfg` split on `AnyRecord::buffer_info` / `transform_input_keys` into single signatures.
+- **`AimxConfig` lost `subscription_queue_size` (Issue #114, Design 030).** The field bounded a per-subscription mpsc channel that no longer exists — subscriptions are now one future in a `FuturesUnordered`. The builder method `.subscription_queue_size(n)` is removed; replace it with `.max_subs_per_connection(n)` if you were using the value as a soft cap on subscription count, or just delete the call.
+- **AimX `Welcome.max_subscriptions` now reports the real per-connection cap.** Previously it returned `subscription_queue_size` (default 100) while the actual cap was implicit; it now returns `max_subs_per_connection` (default 32). Clients that displayed this value will see the change.
+- **AimX `record.subscribe` response no longer carries `queue_size`.** Result object is now `{ "subscription_id": "..." }` — the previous `"queue_size"` reported a number that no longer corresponded to anything in the implementation.
+- **`AimxConfig` gains `max_subs_per_connection: usize` (default 32)** — the dedicated per-connection subscription cap. The existing `max_connections: usize` (previously declared but unread) is now actually enforced by the supervisor; over-cap connections are refused by closing the accepted `UnixStream` pre-handshake.
+
+- **`Producer::produce` is now sync + infallible; `Consumer::subscribe` is now infallible (Design 029 follow-up, M14).** The pre-resolved `WriteHandle::push` cannot fail and the pre-resolved buffer Arc makes `subscribe()` infallible. Call sites collapse: `producer.produce(x).await?` → `producer.produce(x);` and `let Ok(reader) = consumer.subscribe() else { ... }` → `let reader = consumer.subscribe();`. The `ProducerTrait::produce_any` / `ConsumerTrait::subscribe_any` trait surfaces stay `Result`/`async` because the type-erasure downcast remains fallible.
+  - `AimDb::produce<T>(key, value) -> DbResult<()>` is now sync; `.await` on the call site goes away. Only the key lookup can fail.
+  - `Database::produce` likewise sync.
+  - `TypedRecord::produce` was made sync here (was `pub async fn produce`), then **removed entirely in M15** — see _Removed (breaking)_ below.
+  - `aimdb-wasm-adapter`: `bindings::poll_sync` helper deleted — no remaining callers now that `TypedRecord::produce` is sync.
+  - Dead `consumer.subscribe()` error arms in `transform/single.rs` and `transform/join.rs` removed (the `Err` branch was unreachable after M14).
+
+- **`Producer<T>` / `Consumer<T>` drop the runtime parameter `R` and pre-resolve the record at build time (Design 029, M14).** Producer/Consumer become handles to a buffer rather than tickets to look one up: `produce()` is one virtual call (no `HashMap<key>` probe, no `TypeId` check, no downcast), and `subscribe()` collapses to `buffer.subscribe_boxed()`. The internal mechanic is a new crate-private `WriteHandle<T>` trait backed by `RecordWriter<T>` (in `aimdb-core/src/buffer/writer.rs`), pre-bound to the record's `Arc<dyn DynBuffer<T>>` + snapshot mutex + metadata tracker.
+  - `Producer<T, R>` → `Producer<T>`; `Consumer<T, R>` → `Consumer<T>`. User code that names the two-parameter form must drop the trailing adapter arg.
+  - `Producer::key(&self) -> &str` is **removed**. Capture the record key at the registration site instead.
+  - `Producer::produce(value) -> ()` and `Consumer::subscribe() -> Box<dyn BufferReader<T> + Send>` (v0.4 revision — see the sync/infallible bullet above for the rationale and migration). The `ProducerTrait::produce_any` / `ConsumerTrait::subscribe_any` trait surfaces retain `async`/`Result` for the type-erased downcast that can still fail.
+  - `AimDb::producer<T>(key)` / `AimDb::consumer<T>(key)` now return `DbResult<…>` (was infallible). They resolve the typed record up front, so callers that previously assumed inference must add `?`.
+  - `Consumer<T>` cannot exist without a buffer: `.tap()` on a record with no `.buffer(...)` now surfaces as `MissingConfiguration` at build time (was a deferred subscribe-time error).
+  - `TypedRecord::buffer` field is `Option<Arc<dyn DynBuffer<T>>>` (was `Box`); `TypedRecord::set_buffer(Box<…>)` keeps its public signature and converts via `Arc::from(box_)` internally.
+  - `TypedRecord::create_producer_trait(&self)` no longer takes `db` / `record_key` — it uses the new `writer_handle()`.
+  - `ConnectorBuilder<R>` cascade is zero-LOC: no connector struct carried `R` after M13. The outbound `consumer_factory` / inbound `producer_factory` callbacks now resolve the record once at link-startup time (via `db.inner().get_typed_record_by_key`) and construct the new handles.
+  - Codegen-emitted task scaffolds use `Producer<T>` / `Consumer<T>` (no `, TokioAdapter`).
+  - `data-contracts` `log_tap` parameter is `Consumer<T>`.
+
+- **`Spawn` trait removed; `AimDbBuilder::build()` now returns `(AimDb<R>, AimDbRunner)` (Issue #88, Design 028).** Every future the database needs — `.source()`/`.tap()`/`.transform()` tasks, on_start hooks, connector loops, the remote-access supervisor — is collected at build time into the new `AimDbRunner`, then driven by a single `FuturesUnordered` from `runner.run().await`. No background work runs until the runner is polled.
+  - `AimDb::spawn_task` is **deleted**. Migrate to `on_start()` (collected at build) or to a private `FuturesUnordered` inside your own future.
+  - The `Runtime` bundle no longer supertrait-requires `Spawn`. Custom adapters drop `impl Spawn`.
+  - `R: Spawn` bounds are gone everywhere in `aimdb-core` (`Producer`, `Consumer`, `TypedRecord`, `TransformDescriptor`, `RecordRegistrar`, `RecordT`, `AnyRecordExt::as_typed`, remote handler/supervisor, `Database<A>`) — replaced by `R: RuntimeAdapter`.
+  - `RecordSpawner<T>` renamed to `RecordFutureCollector<T>`; its `spawn_all_tasks` → `collect_all_futures`. Internal `spawn_consumer_tasks`/`spawn_producer_service`/`spawn_transform_task` on `TypedRecord` become `collect_consumer_futures`/`collect_producer_future`/`collect_transform_futures`.
+  - Join transforms now hoist their per-input forwarder construction to build time — `JoinPipeline::into_descriptor()` returns a `CollectedTransform { task_future, fanin_futures }` and the lazy `runtime.spawn(forwarder)` inside `run_join_transform` is gone.
+  - `ConnectorBuilder::build()` now returns `Vec<BoxFuture<'static, ()>>` instead of `Arc<dyn Connector>` (which `AimDbBuilder` already discarded).
+  - Unsafe `impl Send/Sync` blocks on `Producer<T, R>` / `Consumer<T, R>` deleted — they auto-derive now.
+  - On the AimX remote-access path, three `runtime.spawn(...)` call sites were temporarily bridged to bare `tokio::spawn` under `#[cfg(feature = "std")]`. These have since been removed by the AimX spawn-free follow-up — see the "AimX remote-access path is now spawn-free" entry above.
+- `on_start` no_std bifurcation collapsed: a single `StartFnType<R>` alias replaces the byte-identical std/no_std pair.
+
+### Removed (breaking)
+
+- **`Database<A>` wrapper removed (Issue #132, design doc §3.8).** The thin façade over `AimDb` (and its `pub use database::Database` re-export) had no users beyond the `TokioDatabase`/`EmbassyDatabase` adapter aliases, themselves used nowhere — both aliases are removed from the adapters in the same change. Use `AimDb<R>` via `AimDbBuilder` directly.
+- **Deprecated `RecordRegistrar::link()` removed (Issue #132).** Deprecated since 0.2.0; use `.link_to()` / `.link_from()`.
+
+- **`TypedRecord::produce` removed (M15, Design 031).** The M14 step (above) made it sync; M15 removes it entirely. All writes now go through `WriteHandle::push` via `TypedRecord::writer_handle()`. `AimDb::produce` and AimX `set_from_json` route through it; as a side effect `set_from_json` now marks record metadata as updated (previously skipped on that path). `WriteHandle` / `RecordWriter` no longer carry the snapshot mutex.
+- **`with_read_only_serialization()` removed (M16, Design 032).** A `Serialize`-only record can no longer be exposed read-only over remote access. Use `with_remote_access()`, which additionally requires `DeserializeOwned`. No in-tree callers existed.
+
+## [1.1.0] - 2026-05-22
+
+### Added
+
+- **Automatic stage profiling (Issue #58, RFC 014, feature `profiling`)**: AimDB now measures wall-clock time per `.source()`, `.tap()`, and `.link()` stage with no user instrumentation. Feature is off by default and adds zero overhead when disabled; `alloc` + a runtime clock is enough, so it works on `no_std + alloc` targets too.
+  - New `profiling` module exporting `StageMetrics` (atomic `call_count` / `total_time_ns` / `avg_time_ns` / `min_time_ns` / `max_time_ns` counters), `RecordProfilingMetrics` per-record container, and serializable `StageProfilingInfo` snapshot.
+  - Source-stage timing measures the interval between successive `Producer::produce()` calls via a new `ProducerProfilingState`. Tap- and link-stage timing wraps the `BufferReader` returned by `Consumer::subscribe()` in a new `ProfilingBufferReader` that times the interval between successive `recv()` yields. The whole-task closure shape of `.source()` / `.tap()` is preserved — no per-value handler changes.
+  - `RecordRegistrar::with_name("...")` assigns a human-readable name to the most recently registered source/tap/link; surfaces in MCP output. Always callable — a no-op when the feature is disabled.
+  - New `StageKind` enum (`Source` / `Tap` / `Link` / `Transform`); `.transform()` is stubbed for future instrumentation.
+  - `RecordMetadata` gains an optional `stage_profiling: Vec<StageProfilingInfo>` field (feature-gated) attached automatically in `TypedRecord::collect_metadata`. New helper `RecordMetadata::with_stage_profiling`.
+  - `AimDb::reset_stage_profiling()` clears every record's counters. New `profiling.reset` AimX RPC method (write-permission gated) wired through `remote::handler`.
+  - New `RuntimeForProfiling` marker trait — blanket-implemented for every `R` when the feature is off, requires `aimdb_executor::TimeOps` when on. Surfaces on `AimDbBuilder::run` / `build` and `AimDb::build_with`. Public API is unchanged when the feature is disabled.
+  - New `Time::duration_as_nanos` accessor on the context (delegates to `TimeOps`).
+  - Dependency: `portable-atomic` (with the `fallback` + `critical-section` features enabled by the `profiling` feature) for 64-bit-atomic emulation on targets without native `AtomicU64` (e.g. `thumbv7em-none-eabihf`).
+- **Writer-exclusivity validation for `.link_from()` (Issue #89)**: `.source()`, `.transform()`, and `.link_from()` are now mutually exclusive on a single record — combining any two now panics at configuration time instead of silently racing on the buffer (last-writer-wins). The check fires from `LinkFromBuilder::finish()` (panic message includes the offending URL), with symmetric defense-in-depth checks added to `TypedRecord::set_producer_service`, `set_transform`, and `add_inbound_connector`. Multiple `.link_from()` calls on the same record (fan-in) remain permitted.
+- **`no_std` support for the full Transform API (Design 027)**: `.transform()` and `.transform_join()` are now available on `no_std + alloc` targets. Multi-input join fan-in is no longer hardcoded to `tokio::sync::mpsc`; it uses the runtime-agnostic `JoinFanInRuntime` traits from `aimdb-executor`, implemented by Tokio, Embassy, and WASM adapters.
+- **`JoinEventRx`** — type-erased trigger receiver passed to the `on_triggers` handler. Call `.recv().await` in a loop to consume `JoinTrigger` events from all input forwarders.
+- **`transform_join` as an inherent method on `RecordRegistrar`** (gated `feature = "alloc"`, `R: JoinFanInRuntime`). Previously only exposed via the `impl_record_registrar_ext!` macro under `feature = "std"`.
+- **Context-Aware Deserializers (Design 026)**: Inbound connector deserializers can now receive a `RuntimeContext<R>` for platform-independent timestamps and logging during deserialization
+  - New `ContextDeserializerFn` type alias for context-aware type-erased deserializer callbacks
+  - New `DeserializerKind` enum (`Raw` / `Context`) to enforce mutual exclusivity between plain and context-aware deserializers
+  - `.with_deserializer(|ctx, bytes| ...)` now accepts a context-aware closure receiving `RuntimeContext<R>`
+  - `.with_deserializer_raw(|bytes| ...)` added for plain bytes-only deserialization (no context needed)
+  - `Router::route()` now accepts an optional type-erased runtime context (`Option<&Arc<dyn Any + Send + Sync>>`)
+  - Context deserializer routes are gracefully skipped when no context is provided
+- **Context-Aware Serializers**: Outbound connector serializers can now receive a `RuntimeContext<R>`, symmetric with deserializers
+  - New `ContextSerializerFn` type alias for context-aware type-erased serializer callbacks
+  - New `SerializerKind` enum (`Raw` / `Context`) to enforce mutual exclusivity between plain and context-aware serializers
+  - `.with_serializer(|ctx, value| ...)` now accepts a context-aware closure receiving `RuntimeContext<R>`
+  - `.with_serializer_raw(|value| ...)` added for plain value-only serialization (no context needed)
+
+### Changed
+
+- **Breaking — Join handler API redesign (Design 027 §Q4)**: `JoinBuilder::with_state(...).on_trigger(Fn(...) -> Pin<Box<dyn Future>>)` replaced with task-model `JoinBuilder::on_triggers(FnOnce(JoinEventRx, Producer) -> impl Future)`. The handler now owns the event loop, eliminating per-event heap allocation and allowing state to be borrowed across `.await` points.
+- **`transform.rs` split into `transform/{mod,single,join}.rs`** — internal reorganization to keep the `alloc`-only join path separate from the runtime-agnostic single-input path. `JoinBuilder`, `JoinPipeline`, `JoinTrigger`, `JoinEventRx` are now re-exported from `transform::join`.
+- `transform_join_raw` now requires `R: JoinFanInRuntime` (was `feature = "std"`).
+- `ExecutorError::QueueClosed` mapped to `DbError::RuntimeError` in `From<ExecutorError>`.
+- **Breaking**: `InboundConnectorLink::deserializer` field type changed from `DeserializerFn` to `DeserializerKind`
+- **Breaking**: `InboundConnectorLink::new()` now takes `DeserializerKind` instead of `DeserializerFn`
+- **Breaking**: `Router::route()` signature changed to accept an additional `ctx` parameter
+- **Breaking**: `RouterBuilder::from_routes()` and `RouterBuilder::add_route()` now take `DeserializerKind` instead of `DeserializerFn`
+- **Breaking**: `ConnectorLink::serializer` field type changed from `Option<SerializerFn>` to `Option<SerializerKind>`
+- **Breaking**: `.with_serializer()` renamed to `.with_serializer_raw()` — old single-argument pattern
+- **Breaking**: `OutboundRoute` type alias updated to use `SerializerKind`
+- **Breaking**: `.with_deserializer()` on `InboundConnectorBuilder` now expects `Fn(RuntimeContext<R>, &[u8]) -> Result<T, String>` instead of `Fn(&[u8]) -> Result<T, String>` — use `.with_deserializer_raw()` for the previous bytes-only signature
+- `AimDb::collect_inbound_routes()` return type updated to use `DeserializerKind`
+
+## [1.0.0] - 2026-03-11
+
+### Added
+
+- `ConnectorUrl::default_port()` now handles `ws://` (→ 1883) and `wss://` (→ 8883) URL schemes for WebSocket connectors
+- `ConnectorUrl::is_secure()` now includes the `wss` scheme
+- Documentation updated with WebSocket URL format examples
+
+## [0.5.0] - 2026-02-21
+
+### Added
+
+- **Transform API (Design 020)**: Reactive data transformations between records
+  - **Single-Input Transforms**: `transform_raw()` method on `RecordRegistrar` for creating reactive derivations
+  - **Multi-Input Joins**: `transform_join_raw()` for combining multiple input records with stateful handlers
+  - **`TransformBuilder`**: Fluent API with `.with_state()` and `.map()` for transform configuration
+  - **`JoinBuilder`**: Multi-input builder with `.input::<T>(key)` and `.with_state().on_trigger()` pattern
+  - **`TransformDescriptor`**: Type-erased descriptor for storing transform configuration
+  - **`JoinTrigger`**: Event type for multi-input join handlers with index and type-erased value
+  - Transforms are spawned as tasks during `AimDb::build()` and subscribe to input buffers
+  - Mutual exclusion enforced: a record cannot have both `.source()` and `.transform()`
+  - Full tracing integration for transform lifecycle events
+- **Graph Introspection API (Design 021)**: Dependency graph visualization and introspection
+  - **`RecordOrigin` enum**: Classifies record data sources (`Source`, `Link`, `Transform`, `TransformJoin`, `Passive`)
+  - **`GraphNode` struct**: Node metadata including origin, buffer config, tap count, outbound status
+  - **`GraphEdge` struct**: Directed edge with `from`, `to`, and edge type classification
+  - **`DependencyGraph` struct**: Full graph with nodes, edges, and topological ordering
+  - New `AnyRecord` trait methods: `has_transform()`, `record_origin()`, `buffer_info()`, `transform_input_keys()`
+  - `RecordId::new()` now accepts `RecordOrigin` parameter for accurate metadata
+  - Graph methods in `AimDbInner`: `build_dependency_graph()`, `graph_nodes()`, `graph_edges()`, `graph_topo_order()`
+- **Record Drain API (Design 019)**: Non-blocking batch history access
+  - **`try_recv()` on BufferReader**: Non-blocking receive returning `Ok(T)`, `Err(BufferEmpty)`, or `Err(BufferLagged)`
+  - **`try_recv_json()` on JsonBufferReader**: JSON-serialized non-blocking receive for remote access
+  - **`record.drain` AimX protocol method**: Drain accumulated values since last call with optional limit
+  - Cold-start semantics: first drain creates reader and returns empty
+  - Supports `SpmcRing` (full history), `SingleLatest` (at most 1), `Mailbox` (at most 1)
+  - Handler maintains per-connection drain readers via `ConnectionState`
+- **Extension Macro**: `impl_record_registrar_ext!` macro in `ext_macros.rs` for generating runtime adapter extension traits
+- **Dynamic Topic/Destination Routing (Design 018)**: Complete support for dynamic topic resolution
+  - **Outbound (`TopicProvider` trait)**: Dynamically determine MQTT topics or KNX group addresses based on data being published
+    - New `TopicProvider<T>` trait for type-safe topic determination
+    - New `TopicProviderAny` trait for type-erased storage
+    - New `TopicProviderWrapper<T, P>` struct for type erasure
+    - New `TopicProviderFn` type alias for stored providers
+    - New `topic_provider` field in `ConnectorLink` struct
+    - New `with_topic_provider()` method on `OutboundConnectorBuilder`
+    - `OutboundRoute` tuple now includes optional `TopicProviderFn`
+  - **Inbound (`TopicResolverFn`)**: Late-binding topic resolution at connector startup
+    - New `TopicResolverFn` type alias for closure-based topic resolution
+    - New `topic_resolver` field in `InboundConnectorLink` struct
+    - New `with_topic_resolver()` method on `InboundConnectorBuilder`
+    - New `resolve_topic()` method on `InboundConnectorLink`
+    - `collect_inbound_routes()` now resolves topics dynamically at route collection time
+  - Enables runtime topic determination from smart contracts, service discovery, or configuration
+  - Works in both `std` and `no_std + alloc` environments
+- **Unit Tests**: Added comprehensive tests for `TopicProvider` and `TopicResolverFn`
+
+### Changed
+
+- **Renamed `.with_serialization()` to `.with_remote_access()`**: Clearer naming for JSON serialization configuration
+- **`RecordId` constructor**: Now requires `RecordOrigin` parameter for dependency graph support
+- **`set_from_json` protection**: Now also rejects writes on records with active transforms (in addition to sources)
+- **Outbound Route Collection**: `collect_outbound_routes()` now returns `OutboundRoute` tuples with optional `TopicProviderFn`
+- **Inbound Topic Resolution**: `collect_inbound_routes()` now calls `link.resolve_topic()` instead of `link.url.resource_id()` directly, enabling dynamic topic resolution
+
+## [0.4.0] - 2025-12-25
+
+### Added
+
+- **RecordKey Trait (Issue #65)**: `RecordKey` is now a trait instead of a struct
+  - Enables user-defined enum keys with `#[derive(RecordKey)]` for compile-time safety
+  - `as_str()` method for string representation
+  - `link_address()` method for connector metadata (MQTT topics, KNX addresses)
+  - `Borrow<str>` bound for O(1) HashMap lookups by string
+  - Blanket implementation for `&'static str`
+- **StringKey Type**: New struct replacing old `RecordKey` struct
+  - `Static(&'static str)` variant for zero-allocation keys
+  - `Interned(&'static str)` variant using `Box::leak` for O(1) Copy/Clone
+  - Implements `RecordKey` trait
+- **derive Feature**: New feature flag enabling `#[derive(RecordKey)]` macro via `aimdb-derive`
+
+### Changed
+
+- **Breaking: RecordKey struct → trait**: The `RecordKey` struct is now a trait. Use `StringKey` for string-based keys or define custom enum keys with `#[derive(RecordKey)]`
+- **StringKey Memory Model**: Dynamic keys now use `Box::leak` (interning) instead of `Arc<str>`. This optimizes for O(1) cloning at the cost of never freeing dynamic key memory (acceptable for startup-time registration pattern)
+
+### Migration Guide
+
+**RecordKey is now a trait (breaking change)**
+
+If you were using `RecordKey` directly, switch to `StringKey`:
+
+```rust
+// Before (this PR)
+use aimdb_core::RecordKey;
+let key: RecordKey = "sensors.temp".into();
+
+// After
+use aimdb_core::StringKey;
+let key: StringKey = "sensors.temp".into();
+```
+
+**For compile-time safe keys (recommended for embedded)**
+
+Use the new derive macro:
+
+```rust
+use aimdb_core::RecordKey;  // Now a trait, re-exported from aimdb-derive
+
+#[derive(RecordKey, Clone, Copy, PartialEq, Eq)]
+pub enum AppKey {
+    #[key = "temp.indoor"]
+    TempIndoor,
+    #[key = "temp.outdoor"]
+    TempOutdoor,
+}
+
+// Compile-time typo detection!
+let producer = db.producer::<Temperature>(AppKey::TempIndoor);
+```
+
+**Note on StringKey memory model**
+
+`StringKey::intern()` leaks memory intentionally for O(1) Copy/Clone. This is
+designed for startup-time registration (<1000 keys). In debug builds, a
+warning fires if you exceed 1000 interned keys.
+
+## [0.3.0] - 2025-12-15
+
+### Added
+
+- **RecordId + RecordKey Architecture (Issue #60)**: Complete rewrite of internal storage for stable record identification
+  - `RecordId`: u32 index wrapper for O(1) Vec-based hot-path access
+  - `StringKey`: Hybrid `&'static str` / interned with `Borrow<str>` for zero-alloc static keys and flexible dynamic keys
+  - O(1) key resolution via `HashMap<RecordKey, RecordId>`
+  - Type introspection via `HashMap<TypeId, Vec<RecordId>>`
+- **Key-Based Producer/Consumer API**:
+  - `produce::<T>(key, value)`: Produce to specific record by key
+  - `subscribe::<T>(key)`: Subscribe to specific record by key  
+  - `producer::<T>(key)`: Get key-bound producer
+  - `consumer::<T>(key)`: Get key-bound consumer
+- **New Types**: `Producer<T, R>` and `Consumer<T, R>` for key-bound access with `.key()` accessor
+- **Introspection Methods**:
+  - `records_of_type::<T>()`: Returns `&[RecordId]` for all records of type T
+  - `resolve_key(key)`: O(1) lookup returning `Option<RecordId>`
+- **New Error Variants**:
+  - `RecordKeyNotFound`: Key doesn't exist in registry
+  - `InvalidRecordId`: RecordId out of bounds  
+  - `TypeMismatch`: Type assertion failed during downcast
+  - `AmbiguousType`: Multiple records of same type (use key-based API)
+  - `DuplicateRecordKey`: Key already registered
+- **RecordMetadata Extensions**: Now includes `record_id: u32` and `record_key: String` fields
+- **Buffer Metrics API**: New `BufferMetrics` trait and `BufferMetricsSnapshot` struct for buffer introspection (feature-gated behind `metrics`)
+  - `produced_count`: Total items pushed to the buffer
+  - `consumed_count`: Total items consumed across all readers  
+  - `dropped_count`: Total items dropped due to lag (documents per-reader semantics)
+  - `occupancy`: Current buffer fill level as `(current, capacity)` tuple
+- **DynBuffer Metrics Method**: Added `metrics_snapshot()` method to `DynBuffer` trait (returns `Option<BufferMetricsSnapshot>`)
+
+### Removed
+
+- **Breaking: Legacy Type-Only Methods**: Removed methods that accessed records by type alone:
+  - `get_typed_record<T>()`: Use `get_typed_record_by_key::<T>(key)` instead
+  - `produce<T>(value)`: Use `produce::<T>(key, value)` instead
+  - `subscribe<T>()`: Use `subscribe::<T>(key)` instead
+  - `producer<T>()`: Use `producer::<T>(key)` instead
+  - `consumer<T>()`: Use `consumer::<T>(key)` instead
+  - This eliminates `AmbiguousType` errors - all record access now requires explicit keys
+
+### Changed
+
+- **Breaking: `configure<T>()` Signature**: Now requires key parameter: `configure::<T>("key", |reg| ...)`
+- **Breaking: Internal Storage**: Changed from `BTreeMap<TypeId, Box<dyn AnyRecord>>` to:
+  - `Vec<Box<dyn AnyRecord>>` for O(1) hot-path access by RecordId
+  - `HashMap<RecordKey, RecordId>` for O(1) name lookups
+  - `HashMap<TypeId, Vec<RecordId>>` for type introspection
+- **Breaking: Key-Based API Only**: All producer/consumer methods now require a record key parameter. This properly supports multi-instance records (e.g., multiple temperature sensors with the same type)
+- **SecurityPolicy**: `ReadWrite` variant now uses `HashSet<String>` for writable record keys
+- **Dependencies**: Added `hashbrown` for no_std-compatible HashMap with `default-hasher` feature
+- **Breaking: DynBuffer No Longer Has Blanket Impl**: The blanket `impl<T, B: Buffer<T>> DynBuffer<T> for B` has been removed. Each adapter now provides its own explicit `DynBuffer` implementation. This enables adapters to provide metrics support via `metrics_snapshot()`. Custom `Buffer<T>` implementations must now also implement `DynBuffer<T>` explicitly.
+
+## [0.2.0] - 2025-11-20
+
+### Added
+
+- **Bidirectional Connector Support**: New `ConnectorBuilder` trait enables connectors to support both outbound (AimDB → External) and inbound (External → AimDB) data flows
+- **Type-Erased Router System**: New `Router` and `RouterBuilder` in `src/router.rs` automatically route incoming messages to correct typed producers without manual dispatch
+- **Inbound Connector API**: New `.link_from()` method for configuring inbound connections (External → AimDB) with deserializer callbacks
+- **Outbound Connector API**: New `.link_to()` method for configuring outbound connections (AimDB → External), replacing generic `.link()`
+- **Producer Trait**: New `ProducerTrait` for type-erased producer calls, enabling dynamic routing of messages to different record types
+- **Resource ID Extraction**: Added `ConnectorUrl::resource_id()` method to extract protocol-specific resource identifiers (topics, keys, paths)
+- **Producer Factory Pattern**: New `ProducerFactoryFn` and `InboundConnectorLink` types for creating producers dynamically at runtime
+- **Consumer Trait for Outbound Routing**: New `ConsumerTrait` and `AnyReader` traits in `src/connector.rs` enable type-erased outbound message publishing, mirroring `ProducerTrait` architecture
+- **Outbound Route Collection**: Added `AimDb::collect_outbound_routes()` method to gather all configured outbound connectors with their type-erased consumers, serializers, and configs
+- **Consumer Factory Pattern**: New `ConsumerFactoryFn` type alias and factory storage in `OutboundConnectorLink` for capturing types at configuration time
+- **Type-Erased Consumer Adapter**: Added `TypedAnyReader` in `src/typed_api.rs` implementing `AnyReader` trait for `Consumer<T, R>`
+
+### Changed
+
+- **Breaking: Connector Registration**: Changed from `.with_connector(scheme, instance)` to `.with_connector(builder)` - connectors now registered as builders
+- **Breaking: Async Build**: `AimDbBuilder::build()` is now async to support connector initialization during database construction
+- **Breaking: ConnectorBuilder Trait**: Updated `build()` signature to take `&AimDb<R>`, enabling route collection via `db.collect_inbound_routes()`
+- **Breaking: Sync Bound on Records**: Added `Sync` bound to `AnyRecord` trait and `TypedRecord<T, R>` implementation. Record types must now be `Send + Sync` (previously only `Send`). This enables safe concurrent access from multiple connector tasks in the bidirectional routing system. Types that were `Send` but not `Sync` must be wrapped in `Arc<Mutex<_>>` or `Arc<RwLock<_>>` for interior mutability.
+- **Breaking: Connector Naming Refactor**: Renamed connector-related APIs to explicitly distinguish outbound (AimDB → External) from inbound (External → AimDB) flows:
+  - `TypedRecord::connectors` field → `outbound_connectors`
+  - `TypedRecord::add_connector()` → `add_outbound_connector()`
+  - `TypedRecord::connectors()` → `outbound_connectors()`
+  - `TypedRecord::connector_count()` → `outbound_connector_count()`
+  - `AnyRecord::connector_count()` → `outbound_connector_count()`
+  - `AnyRecord::connector_urls()` → `outbound_connector_urls()`
+  - `AnyRecord::connectors()` → `outbound_connectors()`
+  - `RecordMetadata::connector_count` → `outbound_connector_count`
+  - Inbound methods (`inbound_connectors()`, `add_inbound_connector()`) remain unchanged for clarity
+- **Deprecated `.link()`**: Generic `.link()` method deprecated in favor of explicit `.link_to()` and `.link_from()`
+- **Builder API**: Enhanced builder to validate buffer requirements for inbound connectors at configuration time
+- **Breaking: Outbound Consumer Architecture**: Refactored outbound connector system to use trait-based type erasure:
+  - Removed: `TypedRecord::spawn_outbound_consumers()` method (automatic spawning)
+  - Changed: `OutboundConnectorLink` now stores `consumer_factory: Arc<ConsumerFactoryFn>` instead of direct consumer
+  - Changed: Connectors must now implement `spawn_outbound_publishers()` and explicitly call `db.collect_outbound_routes()`
+  - Impact: All connectors require code changes to support outbound publishing via the new trait system
+
+### Fixed
+
+- **Memory Management**: Removed `async-trait` dependency that leaked `std` into `no_std` builds, replaced with manual `Pin<Box<dyn Future>>`
+- **Type-Erased Routing**: Fixed producer storage in collections by implementing `ProducerTrait` with `Box<dyn Any>` downcasting
+- **Buffer Validation**: Added validation ensuring inbound connectors have configured buffers before link creation
+- **Consumer Factory Downcasting**: Fixed type downcasting in `typed_api.rs` line 565 - changed from downcasting to `Arc<AimDb<R>>` to downcasting to `AimDb<R>` then wrapping in Arc, resolving "Invalid db type in consumer factory" runtime panic
+
+### Removed
+
+- **Channel Stream**: Removed obsolete channel-based stream abstraction in favor of router-based routing
+- **Automatic Outbound Spawning**: Removed `TypedRecord::spawn_outbound_consumers()` method - outbound publisher spawning now explicit via `ConsumerTrait` and `spawn_outbound_publishers()`
+
+## [0.1.0] - 2025-11-06
+
+### Added
+
+- Initial release of AimDB async in-memory database engine
+- Type-safe record system using `TypeId`-based routing
+- Three buffer types for different data flow patterns:
+  - **SPMC Ring Buffer**: High-frequency data streams with bounded memory
+  - **SingleLatest**: State synchronization and configuration updates
+  - **Mailbox**: Commands and one-shot events
+- Producer-consumer model with async task spawning
+- Runtime adapter abstraction for cross-platform support
+- `no_std` compatibility for embedded targets
+- Error handling with comprehensive `DbResult<T>` and `DbError` types
+- Remote access protocol (AimX v1) for cross-process introspection
+- Connector abstraction for external system integration
+- Builder pattern API for database configuration
+- Record lifecycle management with type-safe APIs
+
+---
+
+[Unreleased]: https://github.com/aimdb-dev/aimdb/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/aimdb-dev/aimdb/compare/v2.0.0...v3.0.0
+[2.0.0]: https://github.com/aimdb-dev/aimdb/compare/v1.1.0...v2.0.0
+[1.1.0]: https://github.com/aimdb-dev/aimdb/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/aimdb-dev/aimdb/compare/v0.5.0...v1.0.0
+[0.5.0]: https://github.com/aimdb-dev/aimdb/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/aimdb-dev/aimdb/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/aimdb-dev/aimdb/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/aimdb-dev/aimdb/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/aimdb-dev/aimdb/releases/tag/v0.1.0

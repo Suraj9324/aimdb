@@ -1,0 +1,117 @@
+[package]
+name = "aimdb-embassy-adapter"
+version = "0.8.0"
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Embassy async runtime adapter for AimDB embedded targets"
+keywords = ["embassy", "embedded", "async", "no_std", "runtime"]
+categories = ["embedded", "asynchronous", "no-std"]
+
+[features]
+default = ["alloc"]
+
+# Heap allocation support (required for Arc-based readers)
+alloc = []
+
+# Runtime features
+embassy-runtime = ["embassy-executor", "embassy-time", "embassy-sync"]
+embassy-net-support = ["embassy-net"]                                  # Network stack support for connectors
+
+connectors = ["aimdb-core/connector-session"]
+# The framed `Connection` spine plus the non-socket byte sources in `io`
+# (`EmbassyUart`): core's I/O traits over `embedded-io-async`, no network stack.
+connector-io = ["connectors", "dep:embedded-io-async"]
+
+# Embassy sockets and dialers behind core's runtime-neutral I/O traits, so
+# connector crates need no `embassy-net` dependency. Deliberately
+# does not imply `embassy-time`: that turns on `defmt-timestamp-uptime`, whose
+# `_defmt_timestamp` collides with every host test binary's `defmt::timestamp!`.
+net = [
+    # The UART in `io` is `connector-io`'s, not this feature's; `net` enables it
+    # so one feature still gets a caller every byte source the adapter offers.
+    "connector-io",
+    "embassy-net-support",
+    "embassy-net/udp",
+    "embassy-net/dns",
+    "dep:embassy-futures",
+]
+
+# Observability features (no_std compatible)
+tracing = ["aimdb-core/tracing", "dep:tracing"]
+log = ["aimdb-core/log"]
+defmt = ["aimdb-core/defmt"]
+
+# Observability: buffer introspection counters plus automatic stage profiling.
+# Backed by `aimdb-core`'s portable-atomic-based counters (with the
+# `critical-section` fallback for 64-bit atomics) plus the Embassy clock, so it
+# works on no_std targets. The final binary must provide a `critical-section`
+# implementation (cortex-m / embassy HALs do).
+observability = ["aimdb-core/observability", "embassy-runtime"]
+
+[dependencies]
+# Core AimDB types - no_std for Embassy (requires alloc for typed APIs)
+aimdb-core = { version = "3.0.0", path = "../aimdb-core", default-features = false, features = [
+    "alloc",
+] }
+
+# Generic framed `Connection` over async UART halves (feature `connector-io`).
+embedded-io-async = { workspace = true, optional = true }
+
+# Executor-independent `yield_now` for the accept/connect retry paths (feature
+# `net`). No dependencies of its own and pulls no executor.
+embassy-futures = { workspace = true, optional = true }
+
+# Embassy ecosystem for embedded async
+embassy-executor = { workspace = true, optional = true }
+embassy-time = { workspace = true, optional = true }
+embassy-sync = { workspace = true, optional = true }
+embassy-net = { workspace = true, optional = true }
+
+# Logging for embedded
+defmt = { workspace = true }
+
+# Observability (optional, no_std compatible)
+tracing = { workspace = true, optional = true, default-features = false }
+
+[dev-dependencies]
+# Phase 5 session smoke (`tests/session_smoke.rs`) drives the runtime-neutral
+# `run_client` engine on the EmbassyAdapter clock — pull in aimdb-core's
+# `connector-session` gate. Dev-only, so the normal no_std lib build (and the
+# thumbv7em checks) stay `alloc`-only.
+aimdb-core = { path = "../aimdb-core", default-features = false, features = [
+    "alloc",
+    "connector-session",
+] }
+
+# Two crossover-wired embassy-net stacks for the host UDP test
+# (`tests/udp.rs`), the same rig the TCP connector's loopback uses.
+embassy-net = { workspace = true, features = [
+    "medium-ip",
+    "proto-ipv4",
+    "udp",
+] }
+embassy-net-driver-channel = "0.4.0"
+
+# For testing on embedded targets
+heapless = "0.9.1"
+
+# Utilities for async testing
+futures = "0.3"
+
+# Provides critical-section impl for host-side tests (embassy_sync channels need it)
+critical-section = { version = "1.1", features = ["std"] }
+
+# Lets host tests register a trivial time driver (defines `_embassy_time_now`),
+# pulled in by embassy-time's `defmt-timestamp-uptime`. No tick feature here so
+# it unifies with the workspace's `tick-hz-32_768` (mock-driver/std would force
+# a conflicting tick rate).
+embassy-time-driver = "0.2.2"
+
+# For tracing tests
+tracing-test = "0.2"
+
+# Random number generation for tests
+rand = "0.10.1"

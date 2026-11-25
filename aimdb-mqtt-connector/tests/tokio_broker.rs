@@ -1,0 +1,643 @@
+//! Host smoke for the embedded MQTT backend over `TokioNet::tcp()`
+//! (`_test-tokio-broker`).
+//!
+//! The same loop as the Embassy smoke, over a real TCP socket with no network
+//! stack to stand up, plus the reconnect: the broker hangs up after the first
+//! SUBACK and the loop must dial again and re-subscribe.
+#![cfg(feature = "_test-tokio-broker")]
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio::net::TcpListener;
+
+mod common;
+use common::{fake_broker, Seen};
+
+// Each test binary defines these exactly once.
+#[defmt::global_logger]
+struct HostTestLogger;
+unsafe impl defmt::Logger for HostTestLogger {
+    fn acquire() {}
+    unsafe fn flush() {}
+    unsafe fn release() {}
+    unsafe fn write(_bytes: &[u8]) {}
+}
+#[defmt::panic_handler]
+fn defmt_panic() -> ! {
+    core::panic!("defmt panic in host test")
+}
+// This binary must define `_defmt_timestamp` itself. `embassy-time` would —
+// `defmt-timestamp-uptime` is enabled here, as it is for `embassy_broker` —
+// but nothing in this test references `embassy-time`, so its object never
+// reaches the link and the symbol would be undefined. `embassy_broker` pulls
+// it in through `embassy-net` and therefore must *not* define one.
+defmt::timestamp!("{=u64:us}", 0);
+
+/// Real wall-clock time; the session loop's delays are `embassy_time`'s until
+/// it takes core's `Delay`.
+struct HostClock;
+impl embassy_time_driver::Driver for HostClock {
+    fn now(&self) -> u64 {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static START: OnceLock<Instant> = OnceLock::new();
+        let start = START.get_or_init(Instant::now);
+        (start.elapsed().as_micros() * u128::from(embassy_time_driver::TICK_HZ) / 1_000_000) as u64
+    }
+    fn schedule_wake(&self, _at: u64, waker: &core::task::Waker) {
+        waker.wake_by_ref();
+    }
+}
+embassy_time_driver::time_driver_impl!(static HOST_CLOCK: HostClock = HostClock);
+
+// ---------------------------------------------------------------------------
+// The test.
+// ---------------------------------------------------------------------------
+
+/// The session loop re-subscribes after the broker hangs up. Losing that is
+/// silent — publishes keep working and only inbound routing stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_session_loop_reconnects_and_resubscribes() {
+    let key_temperature_1 = aimdb_core::Name::<u64>::new("temperature");
+    use aimdb_core::buffer::BufferCfg;
+    use aimdb_core::AimDbBuilder;
+    use aimdb_mqtt_connector::MqttConnector;
+    use aimdb_tokio_adapter::net::TokioNet;
+    use aimdb_tokio_adapter::{TokioAdapter, TokioRecordRegistrarExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Seen::default()));
+
+    let connector = MqttConnector::new(format!("mqtt://127.0.0.1:{port}"))
+        .transport(TokioNet::tcp())
+        .with_client_id("host-smoke");
+
+    let mut builder = AimDbBuilder::new()
+        .runtime(Arc::new(TokioAdapter))
+        .with_connector(connector);
+    builder.configure(key_temperature_1, |reg| {
+        reg.buffer(BufferCfg::SingleLatest)
+            .link_from("mqtt://sensors/temperature")
+            .with_deserializer(|_ctx, data: &[u8]| {
+                core::str::from_utf8(data)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .ok_or_else(|| aimdb_core::IngestError::from("bad payload"))
+            })
+            .finish();
+    });
+    let (_db, runner) = builder.build().await.expect("build db");
+
+    let broker = fake_broker(listener, seen.clone(), 1, None);
+    let until_resubscribed = async {
+        while seen.lock().unwrap().subscribes.len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+
+    tokio::select! {
+        _ = runner.run() => panic!("the session loop returned"),
+        _ = broker => panic!("the broker returned"),
+        _ = until_resubscribed => {}
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            let seen = seen.lock().unwrap();
+            panic!(
+                "watchdog: {} connects, {} subscribes",
+                seen.connects,
+                seen.subscribes.len()
+            );
+        }
+    }
+
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.connects >= 2,
+        "the loop must redial after the hang-up; saw {} connects",
+        seen.connects
+    );
+    for (n, topics) in seen.subscribes.iter().enumerate() {
+        assert!(
+            topics.iter().any(|t| t == "sensors/temperature"),
+            "connection {n} did not subscribe the inbound topic; saw {topics:?}"
+        );
+    }
+}
+
+/// The embedded backend carries records both ways over `TokioNet::tcp()`, on a
+/// multi-thread runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_embedded_backend_round_trips_records_on_a_multi_thread_runtime() {
+    let key_temperature_2 = aimdb_core::Name::<u64>::new("temperature");
+    let key_uptime_3 = aimdb_core::Name::<u64>::new("uptime");
+    use aimdb_core::buffer::BufferCfg;
+    use aimdb_core::AimDbBuilder;
+    use aimdb_mqtt_connector::MqttConnector;
+    use aimdb_tokio_adapter::net::TokioNet;
+    use aimdb_tokio_adapter::{TokioAdapter, TokioRecordRegistrarExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Seen::default()));
+
+    let connector = MqttConnector::new(format!("mqtt://127.0.0.1:{port}"))
+        .transport(TokioNet::tcp())
+        .with_client_id("round-trip");
+
+    let mut builder = AimDbBuilder::new()
+        .runtime(Arc::new(TokioAdapter))
+        .with_connector(connector);
+
+    // Inbound: the broker's PUBLISH lands here.
+    builder.configure(key_temperature_2, |reg| {
+        reg.buffer(BufferCfg::SingleLatest)
+            .link_from("mqtt://sensors/temperature")
+            .with_deserializer(|_ctx, data: &[u8]| {
+                core::str::from_utf8(data)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .ok_or_else(|| aimdb_core::IngestError::from("bad payload"))
+            })
+            .finish();
+    });
+
+    // Outbound: this record's producer publishes to the broker.
+    builder.configure(key_uptime_3, |reg| {
+        reg.buffer(BufferCfg::SingleLatest)
+            .source(|_ctx, producer| async move {
+                loop {
+                    producer.produce(42u64);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .link_to("mqtt://sensors/uptime")
+            .with_serializer(|_ctx, v: &u64| Ok(v.to_string().into_bytes()))
+            .finish();
+    });
+
+    let (db, runner) = builder.build().await.expect("build db");
+    let mut inbound = db
+        .consumer(key_temperature_2)
+        .expect("temperature consumer")
+        .subscribe();
+
+    let broker = fake_broker(
+        listener,
+        seen.clone(),
+        0,
+        Some(("sensors/temperature", b"23")),
+    );
+    let seen_for_wait = seen.clone();
+
+    let received = tokio::select! {
+        _ = runner.run() => panic!("the session loop returned"),
+        _ = broker => panic!("the broker returned"),
+        received = async {
+            let value = inbound.recv().await.expect("inbound record").value;
+            while seen_for_wait.lock().unwrap().published.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            value
+        } => received,
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            let seen = seen.lock().unwrap();
+            panic!(
+                "watchdog: {} connects, {} subscribes, {} publishes",
+                seen.connects,
+                seen.subscribes.len(),
+                seen.published.len()
+            );
+        }
+    };
+
+    assert_eq!(received, 23, "the broker's PUBLISH must reach the record");
+
+    let seen = seen.lock().unwrap();
+    let (topic, payload) = seen
+        .published
+        .first()
+        .expect("the outbound link must reach the broker");
+    assert_eq!(topic, "sensors/uptime");
+    assert_eq!(payload, b"42", "the serializer's bytes must arrive intact");
+}
+
+/// Two connectors in one process keep their own identities: nothing about a
+/// connector's client id is process-global, so the second does not connect
+/// under the first's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_connectors_in_one_process_keep_their_own_client_ids() {
+    use aimdb_core::buffer::BufferCfg;
+    use aimdb_core::AimDbBuilder;
+    use aimdb_mqtt_connector::MqttConnector;
+    use aimdb_tokio_adapter::net::TokioNet;
+    use aimdb_tokio_adapter::{TokioAdapter, TokioRecordRegistrarExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("mqtt://127.0.0.1:{port}");
+    let seen = Arc::new(Mutex::new(Seen::default()));
+
+    let mut runners = Vec::new();
+    for id in ["first-node", "second-node"] {
+        let key_temperature_4 = aimdb_core::Name::<u64>::new("temperature");
+        let mut builder = AimDbBuilder::new()
+            .runtime(Arc::new(TokioAdapter))
+            .with_connector(
+                MqttConnector::new(url.clone())
+                    .transport(TokioNet::tcp())
+                    .with_client_id(id),
+            );
+        builder.configure(key_temperature_4, |reg| {
+            reg.buffer(BufferCfg::SingleLatest)
+                .link_from("mqtt://sensors/temperature")
+                .with_deserializer(|_ctx, _data: &[u8]| Ok(0u64))
+                .finish();
+        });
+        let (_db, runner) = builder.build().await.expect("build db");
+        runners.push(runner);
+    }
+
+    let broker = common::fake_broker_concurrent(listener, seen.clone(), None);
+    let seen_for_wait = seen.clone();
+    let second = runners.pop().unwrap();
+    let first = runners.pop().unwrap();
+
+    tokio::select! {
+        _ = first.run() => panic!("the first runner returned"),
+        _ = second.run() => panic!("the second runner returned"),
+        _ = broker => panic!("the broker returned"),
+        _ = async {
+            while seen_for_wait.lock().unwrap().client_ids.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        } => {}
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            panic!("watchdog: saw {:?}", seen.lock().unwrap().client_ids);
+        }
+    }
+
+    let mut ids = seen.lock().unwrap().client_ids.clone();
+    ids.sort();
+    assert_eq!(ids, vec!["first-node", "second-node"]);
+}
+
+/// Connects a client subscribed to `sensors/temperature` against a broker that
+/// pushes `payload_len` bytes after every SUBACK, as it would a retained
+/// message, and returns what the broker saw after `wait` plus the length the
+/// record last received.
+async fn with_retained_push(payload_len: usize, wait: Duration) -> (Seen, Option<u64>) {
+    let key_temperature_5 = aimdb_core::Name::<u64>::new("temperature");
+    use aimdb_core::buffer::BufferCfg;
+    use aimdb_core::AimDbBuilder;
+    use aimdb_mqtt_connector::MqttConnector;
+    use aimdb_tokio_adapter::net::TokioNet;
+    use aimdb_tokio_adapter::{TokioAdapter, TokioRecordRegistrarExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Seen::default()));
+
+    let connector = MqttConnector::new(format!("mqtt://127.0.0.1:{port}"))
+        .transport(TokioNet::tcp())
+        .with_client_id("max-packet-size");
+    let mut builder = AimDbBuilder::new()
+        .runtime(Arc::new(TokioAdapter))
+        .with_connector(connector);
+    builder.configure(key_temperature_5, |reg| {
+        reg.buffer(BufferCfg::SingleLatest)
+            .link_from("mqtt://sensors/temperature")
+            .with_deserializer(|_ctx, data: &[u8]| {
+                Ok::<u64, aimdb_core::IngestError>(data.len() as u64)
+            })
+            .finish();
+    });
+    let (db, runner) = builder.build().await.expect("build db");
+    let record_key_1 = aimdb_core::Name::<u64>::new("temperature");
+    let mut reader = db.subscribe(record_key_1).expect("subscribe");
+
+    let payload = vec![b'x'; payload_len];
+    let broker = fake_broker(
+        listener,
+        seen.clone(),
+        0,
+        Some(("sensors/temperature", payload.as_slice())),
+    );
+    let mut received = None;
+    let observe = async {
+        loop {
+            received = Some(reader.recv().await.expect("record open").value);
+        }
+    };
+    tokio::select! {
+        _ = runner.run() => panic!("the session loop returned"),
+        _ = broker => panic!("the broker returned"),
+        _ = observe => unreachable!(),
+        _ = tokio::time::sleep(wait) => {}
+    }
+    let seen = std::mem::take(&mut *seen.lock().unwrap());
+    (seen, received)
+}
+
+/// The CONNECT advertises the largest packet the session always receives, so
+/// a broker withholds a larger retained message instead of sending one that
+/// would end every session it is replayed into.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retained_message_over_the_maximum_packet_size_is_withheld() {
+    let wait = Duration::from_secs(3);
+
+    let (seen, received) = with_retained_push(3000, wait).await;
+    assert_eq!(seen.max_packet_sizes, [3328]);
+    assert_eq!((seen.connects, seen.withheld), (1, 0));
+    assert_eq!(received, Some(3000), "a message within the limit arrives");
+
+    let (seen, received) = with_retained_push(4000, wait).await;
+    assert_eq!(seen.max_packet_sizes, [3328]);
+    assert_eq!(seen.connects, 1, "no reconnect loop");
+    assert_eq!(seen.withheld, 1);
+    assert_eq!(received, None);
+}
+
+/// Inbound publishes are dispatched by the session task itself: with inbound
+/// links and no outbound ones, the connector contributes one future.
+#[tokio::test]
+async fn the_embedded_backend_dispatches_inbound_on_its_session_task() {
+    let key_temperature_6 = aimdb_core::Name::<u64>::new("temperature");
+    use aimdb_core::buffer::BufferCfg;
+    use aimdb_core::connector::ConnectorBuilder;
+    use aimdb_core::AimDbBuilder;
+    use aimdb_mqtt_connector::MqttConnector;
+    use aimdb_tokio_adapter::net::TokioNet;
+    use aimdb_tokio_adapter::{TokioAdapter, TokioRecordRegistrarExt};
+
+    let connector = || MqttConnector::new("mqtt://127.0.0.1:1").transport(TokioNet::tcp());
+    let mut builder = AimDbBuilder::new()
+        .runtime(Arc::new(TokioAdapter))
+        .with_connector(connector());
+    builder.configure(key_temperature_6, |reg| {
+        reg.buffer(BufferCfg::SingleLatest)
+            .link_from("mqtt://sensors/temperature")
+            .with_deserializer(|_ctx, data: &[u8]| {
+                Ok::<u64, aimdb_core::IngestError>(data.len() as u64)
+            })
+            .finish();
+    });
+    let (db, _runner) = builder.build().await.expect("build db");
+
+    // Built, never polled: nothing dials.
+    let futures = connector().build(&db).await.expect("build connector");
+    assert_eq!(futures.len(), 1, "the session task, and no inbound pump");
+}
+
+// ---------------------------------------------------------------------------
+// Build-time checks: per-route options and what the write ring can carry.
+// ---------------------------------------------------------------------------
+
+/// An embedded-backend connector that never dials.
+macro_rules! embedded {
+    () => {
+        aimdb_mqtt_connector::MqttConnector::new("mqtt://127.0.0.1:1")
+            .transport(aimdb_tokio_adapter::net::TokioNet::tcp())
+    };
+}
+
+/// Builds a database with `connector` and the records `configure` adds.
+async fn build(
+    connector: impl aimdb_core::connector::ConnectorBuilder + 'static,
+    configure: impl FnOnce(&mut aimdb_core::AimDbBuilder),
+) -> Result<(), String> {
+    let mut builder = aimdb_core::AimDbBuilder::new()
+        .runtime(Arc::new(aimdb_tokio_adapter::TokioAdapter))
+        .with_connector(connector);
+    configure(&mut builder);
+    builder.build().await.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// One outbound record on `sensors/out` with `config` on its link and, given
+/// a capacity, a scratch serializer.
+fn outbound(
+    config: &'static [(&'static str, &'static str)],
+    scratch: Option<usize>,
+) -> impl FnOnce(&mut aimdb_core::AimDbBuilder) {
+    move |builder| {
+        let key_out_7 = aimdb_core::Name::<u64>::new("out");
+        use aimdb_tokio_adapter::TokioRecordRegistrarExt;
+        builder.configure(key_out_7, move |reg| {
+            let mut link = reg
+                .buffer(aimdb_core::buffer::BufferCfg::SingleLatest)
+                .link_to("mqtt://sensors/out")
+                .with_serializer(|_ctx, v: &u64| Ok(v.to_le_bytes().to_vec()));
+            for (k, v) in config {
+                link = link.with_config(k, v);
+            }
+            if let Some(capacity) = scratch {
+                link = link.with_serializer_into(capacity, |_ctx, v: &u64, out| {
+                    out[..8].copy_from_slice(&v.to_le_bytes());
+                    Ok(8)
+                });
+            }
+            link.finish();
+        });
+    }
+}
+
+#[tokio::test]
+async fn an_invalid_qos_or_retain_fails_the_build() {
+    for (key, value, expected) in [
+        ("qos", "3", "qos must be 0, 1 or 2, got '3'"),
+        ("qos", "abc", "qos must be 0, 1 or 2, got 'abc'"),
+        ("retain", "yes", "retain must be true or false, got 'yes'"),
+    ] {
+        let config: &'static [(&str, &str)] = Box::leak(Box::new([(key, value)]));
+        let err = build(embedded!(), outbound(config, None))
+            .await
+            .unwrap_err();
+        assert!(err.contains("route 'sensors/out'"), "{err}");
+        assert!(err.contains(expected), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn a_route_too_large_for_the_write_ring_fails_the_build() {
+    let err = build(embedded!(), outbound(&[], Some(3000)))
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("route 'sensors/out': its largest PUBLISH is"),
+        "{err}"
+    );
+    assert!(err.contains("it is 4096"), "{err}");
+
+    build(
+        embedded!().with_write_buffer(8192),
+        outbound(&[], Some(3000)),
+    )
+    .await
+    .expect("a larger ring carries it");
+}
+
+#[tokio::test]
+async fn a_connect_too_large_for_the_write_ring_fails_the_build() {
+    let password = "p".repeat(2100);
+    let err = build(embedded!().with_credentials("user", &password), |_| {})
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("the CONNECT (client id and credentials) is"),
+        "{err}"
+    );
+
+    build(
+        embedded!()
+            .with_credentials("user", &password)
+            .with_write_buffer(8192),
+        |_| {},
+    )
+    .await
+    .expect("a larger ring carries it");
+}
+
+#[tokio::test]
+async fn a_subscribe_too_large_for_the_write_ring_fails_the_build() {
+    let topic = format!("sensors/{}", "t".repeat(2100));
+    let inbound = |topic: String| {
+        move |builder: &mut aimdb_core::AimDbBuilder| {
+            let key_in_8 = aimdb_core::Name::<u64>::new("in");
+            use aimdb_tokio_adapter::TokioRecordRegistrarExt;
+            builder.configure(key_in_8, move |reg| {
+                reg.buffer(aimdb_core::buffer::BufferCfg::SingleLatest)
+                    .link_from(&format!("mqtt://{topic}"))
+                    .with_deserializer(|_ctx, data: &[u8]| {
+                        Ok::<u64, aimdb_core::IngestError>(data.len() as u64)
+                    })
+                    .finish();
+            });
+        }
+    };
+    let err = build(embedded!(), inbound(topic.clone()))
+        .await
+        .unwrap_err();
+    assert!(err.contains("the SUBSCRIBE to 'sensors/"), "{err}");
+
+    build(embedded!().with_write_buffer(8192), inbound(topic))
+        .await
+        .expect("a larger ring carries it");
+}
+
+/// Two brokers in one db: each connector registers its own scheme and carries
+/// only that scheme's links, in both directions. The scheme is set before
+/// `.transport(..)`, so it must survive the switch to the embedded backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_scheme_reaches_only_its_own_broker() {
+    use aimdb_core::buffer::BufferCfg;
+    use aimdb_core::AimDbBuilder;
+    use aimdb_mqtt_connector::MqttConnector;
+    use aimdb_tokio_adapter::net::TokioNet;
+    use aimdb_tokio_adapter::{TokioAdapter, TokioRecordRegistrarExt};
+
+    let plant_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cloud_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let plant_port = plant_listener.local_addr().unwrap().port();
+    let cloud_port = cloud_listener.local_addr().unwrap().port();
+    let plant = Arc::new(Mutex::new(Seen::default()));
+    let cloud = Arc::new(Mutex::new(Seen::default()));
+
+    let mut builder = AimDbBuilder::new()
+        .runtime(Arc::new(TokioAdapter))
+        .with_connector(
+            MqttConnector::new(format!("mqtt://127.0.0.1:{plant_port}"))
+                .scheme("mqtt-plant")
+                .transport(TokioNet::tcp())
+                .with_client_id("plant"),
+        )
+        .with_connector(
+            MqttConnector::new(format!("mqtt://127.0.0.1:{cloud_port}"))
+                .scheme("mqtt-cloud")
+                .transport(TokioNet::tcp())
+                .with_client_id("cloud"),
+        );
+
+    for (key, address) in [
+        ("setpoint", "mqtt-plant://plant/setpoint"),
+        ("command", "mqtt-cloud://cloud/command"),
+    ] {
+        let record_key_2 = aimdb_core::Name::<u64>::interned(key);
+        builder.configure(record_key_2, |reg| {
+            reg.buffer(BufferCfg::SingleLatest)
+                .link_from(address)
+                .with_deserializer(|_ctx, data: &[u8]| {
+                    core::str::from_utf8(data)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .ok_or_else(|| aimdb_core::IngestError::from("bad payload"))
+                })
+                .finish();
+        });
+    }
+    for (key, address, value) in [
+        ("flow", "mqtt-plant://plant/flow", 7u64),
+        ("flow_avg", "mqtt-cloud://cloud/flow_avg", 8u64),
+    ] {
+        let record_key_3 = aimdb_core::Name::<u64>::interned(key);
+        builder.configure(record_key_3, |reg| {
+            reg.buffer(BufferCfg::SingleLatest)
+                .source(move |_ctx, producer| async move {
+                    loop {
+                        producer.produce(value);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .link_to(address)
+                .with_serializer(|_ctx, v: &u64| Ok(v.to_string().into_bytes()))
+                .finish();
+        });
+    }
+    let (_db, runner) = builder
+        .build()
+        .await
+        .expect("one connector per scheme builds");
+
+    let both_ready = async {
+        let ready = |seen: &Mutex<Seen>| {
+            let seen = seen.lock().unwrap();
+            !seen.subscribes.is_empty() && !seen.published.is_empty()
+        };
+        while !(ready(&plant) && ready(&cloud)) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+
+    tokio::select! {
+        _ = runner.run() => panic!("the session loops returned"),
+        _ = fake_broker(plant_listener, plant.clone(), 0, None) => panic!("plant broker returned"),
+        _ = fake_broker(cloud_listener, cloud.clone(), 0, None) => panic!("cloud broker returned"),
+        _ = both_ready => {}
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            let (p, c) = (plant.lock().unwrap(), cloud.lock().unwrap());
+            panic!(
+                "watchdog: plant {} subscribes / {} publishes, cloud {} / {}",
+                p.subscribes.len(), p.published.len(), c.subscribes.len(), c.published.len()
+            );
+        }
+    }
+
+    for (seen, client_id, subscribed, published, payload) in [
+        (&plant, "plant", "plant/setpoint", "plant/flow", b"7"),
+        (&cloud, "cloud", "cloud/command", "cloud/flow_avg", b"8"),
+    ] {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.client_ids, [client_id]);
+        assert_eq!(
+            seen.subscribed_topics(),
+            [subscribed],
+            "{client_id} subscriptions"
+        );
+        assert!(
+            seen.published
+                .iter()
+                .all(|(topic, data)| topic == published && data == payload),
+            "{client_id} must publish only its own scheme's link; saw {:?}",
+            seen.published
+        );
+    }
+}

@@ -1,0 +1,488 @@
+# aimdb-mqtt-connector
+
+MQTT connector for AimDB - supports both std (Tokio) and no_std (Embassy) environments.
+
+## Installation
+
+⚠️ **Important**: For Embassy runtime support, this connector requires a patched version of `mountain-mqtt` with updated Embassy dependencies.
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+# The rumqttc backend (std): QoS 0-2, platform trust roots
+aimdb-mqtt-connector = { version = "0.8", features = ["std"] }
+
+# The mountain-mqtt backend: any target that can supply a transport
+aimdb-mqtt-connector = { version = "0.8", default-features = false, features = ["embedded"] }
+
+# ... or the Embassy convenience bundle, which adds the transport and clock
+aimdb-mqtt-connector = { version = "0.8", default-features = false, features = ["embassy-runtime"] }
+```
+
+The split is **std vs `no_std`**, not Tokio vs Embassy: the embedded backend
+runs on any runtime whose adapter supplies a `StreamDialer`, so a new platform
+needs an adapter crate and no change here.
+
+## Overview
+
+`aimdb-mqtt-connector` provides MQTT publishing capabilities for AimDB records with automatic consumer registration. One `MqttConnector` covers both backends: supply no transport and it is `rumqttc`; supply one with `.transport(..)` and it is `mountain-mqtt` over whatever the adapter dials.
+
+**Key Features:**
+- **Two backends, one type**: `rumqttc` on std, `mountain-mqtt` anywhere else
+- **Automatic Consumer Registration**: Connects to records via builder pattern
+- **Topic Mapping**: Flexible record-to-topic configuration
+- **Custom Serialization**: Pluggable serializers (JSON, MessagePack, etc.)
+- **QoS Control**: Configure MQTT quality of service levels
+
+## Quick Start
+
+### Tokio (Standard Library)
+
+Example:
+```rust
+use aimdb_core::{AimDbBuilder, buffer::BufferCfg};
+use aimdb_tokio_adapter::{TokioAdapter, TokioRecordRegistrarExt};
+use aimdb_mqtt_connector::MqttConnector;
+use std::sync::Arc;
+
+#[derive(Clone, serde::Serialize)]
+struct Temperature {
+    celsius: f32,
+    sensor_id: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create runtime adapter
+    let runtime = Arc::new(TokioAdapter::new()?);
+    
+    // Create MQTT connector
+    let mqtt = Arc::new(MqttConnector::new("mqtt://localhost:1883").await?);
+    
+    // Build database with connector
+    let mut builder = AimDbBuilder::new()
+        .runtime(runtime)
+        .with_connector("mqtt", mqtt);
+    
+    builder.configure::<Temperature>(|reg| {
+        reg.buffer(BufferCfg::SingleLatest)
+           .link("mqtt://sensors/temperature")
+           .with_serializer(|t| {
+               serde_json::to_vec(t)
+                   .map_err(|_| aimdb_core::connector::SerializeError::InvalidData)
+           })
+           .finish();
+    });
+    
+    builder.run().await
+}
+```
+
+### Embassy (Embedded)
+
+Add to your `Cargo.toml`:
+```toml
+[dependencies]
+aimdb-core = { version = "3.0", default-features = false }
+aimdb-embassy-adapter = { version = "0.8", default-features = false }
+aimdb-mqtt-connector = { version = "0.8", default-features = false, features = ["embassy-runtime"] }
+```
+
+Example:
+```rust
+#![no_std]
+#![no_main]
+
+use aimdb_core::AimDbBuilder;
+use aimdb_embassy_adapter::net::EmbassyNet;
+use aimdb_embassy_adapter::{EmbassyAdapter, EmbassyBufferType, EmbassyRecordRegistrarExt};
+use aimdb_mqtt_connector::MqttConnector;
+use alloc::sync::Arc;
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    // Initialize network stack
+    let stack: &'static embassy_net::Stack<'static> = /* ... */;
+
+    // The adapter is a stateless unit type; the connector takes a transport
+    // from it, and nothing else about the runtime.
+    let runtime = Arc::new(EmbassyAdapter::new());
+
+    // Build database with MQTT connector
+    let mut builder = AimDbBuilder::new()
+        .runtime(runtime)
+        .with_connector(
+            MqttConnector::new("mqtt://192.168.1.100:1883")
+                .transport(EmbassyNet::tcp(*stack, rx_buf, tx_buf)),
+        );
+
+    let record_1 = aimdb_core::Name::<SensorData>::new("sensor-data");
+    builder.configure(record_1, |reg| {
+        reg.buffer_sized::<4, 1>(EmbassyBufferType::SingleLatest)
+           .source(sensor_producer)
+           // Outbound: Publish to MQTT
+           .link_to("mqtt://data/sensor")
+           .with_serializer(|data| {
+               // Use postcard or similar no_std serializer
+               postcard::to_vec(data)
+                   .map_err(|_| aimdb_core::connector::SerializeError::InvalidData)
+           })
+           .finish()
+           // Inbound: Subscribe from MQTT
+           .link_from("mqtt://commands/sensor")
+           .with_deserializer(|_ctx, data| SensorCommand::from_bytes(data).map_err(Into::into))
+           .finish();
+    });
+    
+    let _db = builder.build().await.unwrap();
+    
+    // Database and MQTT run in background automatically
+    loop {
+        // Main application loop
+    }
+}
+```
+
+## Architecture
+
+```
+┌─────────────────────┐
+│   AimDB Record      │
+│   (Temperature)     │
+└──────────┬──────────┘
+           │
+           ▼
+    ┌──────────────┐
+    │  Consumer    │
+    │ (auto-reg)   │
+    └──────┬───────┘
+           │
+           ▼
+┌──────────────────────┐
+│  MQTT Connector      │
+│  - Serialize         │
+│  - Publish           │
+└──────────┬───────────┘
+           │
+           ▼
+    MQTT Broker
+```
+
+## Configuration
+
+### Connector Creation
+
+```rust
+// Tokio - simple broker URL
+let mqtt = MqttConnector::new("mqtt://localhost:1883").await?;
+
+// Tokio - secure connection
+let mqtt = MqttConnector::new("mqtts://broker.example.com:8883").await?;
+
+// Note: Client ID is auto-generated, credentials extracted from URL if provided
+// Example with credentials: mqtt://username:password@broker:1883
+```
+
+### Several Brokers
+
+Each connector registers a link scheme, `mqtt` by default. Give each broker
+its own scheme with `.scheme(…)`, and links pick the broker by it:
+
+```rust
+let builder = AimDbBuilder::new()
+    .runtime(runtime)
+    .with_connector(MqttConnector::new("mqtt://plant.local:1883").scheme("mqtt-plant"))
+    .with_connector(MqttConnector::new("mqtts://cloud.example.com:8883").scheme("mqtt-cloud"));
+
+reg.link_from("mqtt-plant://plant/boiler/flow_temp")   // plant broker
+reg.link_to("mqtt-cloud://plant/boiler/flow_avg")      // cloud broker
+```
+
+The scheme changes routing only: the broker URL's `mqtt://` or `mqtts://`
+still selects plain TCP or TLS. Two connectors on the same scheme fail at
+`build()`, since each would claim every link of that scheme.
+
+### Link Configuration
+
+```rust
+// Basic link with JSON serialization
+reg.link("mqtt://topic/path")
+   .with_serializer(|data| {
+       serde_json::to_vec(data)
+           .map_err(|_| aimdb_core::connector::SerializeError::InvalidData)
+   })
+   .finish();
+
+// Override QoS and retain per link
+reg.link("mqtt://topic/path")
+   .with_qos(1)          // QoS 1
+   .with_retain(true)    // Retain message
+   .with_serializer(|data| {
+       serde_json::to_vec(data)
+           .map_err(|_| aimdb_core::connector::SerializeError::InvalidData)
+   })
+   .finish();
+```
+
+## Topic Mapping
+
+### Static Topics
+```rust
+// Simple topic
+reg.link("mqtt://sensors/temperature")
+
+// Nested topics
+reg.link("mqtt://building/floor1/room5/temperature")
+```
+
+### Dynamic Topics (Planned)
+```rust
+// Template-based (future feature)
+reg.link("mqtt://sensors/{sensor_id}/temperature")
+```
+
+## Serialization
+
+### JSON (std)
+```rust
+.with_serializer(|data| {
+    serde_json::to_vec(data)
+        .map_err(|_| aimdb_core::connector::SerializeError::InvalidData)
+})
+```
+
+### MessagePack (std)
+```rust
+.with_serializer(|data| {
+    rmp_serde::to_vec(data)
+        .map_err(|_| aimdb_core::connector::SerializeError::InvalidData)
+})
+```
+
+### Postcard (no_std)
+```rust
+.with_serializer(|data| {
+    postcard::to_vec(data)
+        .map_err(|_| aimdb_core::connector::SerializeError::InvalidData)
+})
+```
+
+### Custom Binary
+```rust
+.with_serializer(|data: &Temperature| {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&data.celsius.to_le_bytes());
+    buf.extend_from_slice(data.sensor_id.as_bytes());
+    Ok(buf)
+})
+```
+
+## MQTT Libraries Used
+
+### Standard Library (Tokio)
+- **rumqttc**: Async MQTT client with robust reconnection
+- Supports MQTT 3.1.1 and 5.0
+- TLS support available
+
+### Embedded (Embassy)
+- **mountain-mqtt**: no_std MQTT client
+- Optimized for resource-constrained devices
+- Supports MQTT 3.1.1
+
+## QoS Levels
+
+MQTT Quality of Service levels are configured using integers:
+
+```rust
+.with_qos(0)  // AtMostOnce - Fire and forget
+.with_qos(1)  // AtLeastOnce - Acknowledged delivery (default)
+.with_qos(2)  // ExactlyOnce - Assured delivery
+```
+
+On an outbound link this is the publish QoS. On an inbound link it is the
+subscribe QoS, and the broker delivers each message at the lower of the
+publish and subscribe QoS:
+
+```rust
+reg.link_from("mqtt://sensors/{room}/temp")
+   .with_qos(0)          // high-rate telemetry: no acknowledgements
+   .with_deserializer(|_ctx, data: &[u8]| parse(data).map_err(Into::into))
+   .finish();
+```
+
+When a pattern link covers an exact one (`sensors/+/temp` covers
+`sensors/kitchen/temp`), only the covering filter is subscribed, at the highest
+QoS among the links it stands for: with `.with_qos(2)` on the exact link, the
+filter is subscribed at 2. A QoS other than 0, 1 or 2 fails the build.
+
+**Recommendations:**
+- **QoS 0**: High-frequency sensor data, low-priority logs
+- **QoS 1**: Commands, important events (default)
+- **QoS 2**: Critical state changes, financial transactions
+
+> **Backend note:** only the `std` (`rumqttc`) backend implements QoS 2. On the
+> `embedded` backend a `qos=2` route publishes, or subscribes, at QoS 1
+> (at-least-once) and logs a warning naming that route at startup, so the same
+> route gives a weaker guarantee there. Design for at-least-once if the route
+> has to run on both.
+>
+> Set QoS with `.with_qos(n)` on the link — a `?qos=` query in the link URL is
+> stripped during parsing and has no effect.
+
+## Error Handling
+
+```rust
+pub enum MqttError {
+    InvalidUrl(String),
+    ConnectionFailed(String),
+    PublishFailed(String),
+    SubscriptionFailed(String),
+    MissingConfig(String),
+    DbError(DbError),
+}
+```
+
+Serialization errors are returned via `SerializeError`:
+```rust
+pub enum SerializeError {
+    InvalidData,
+    TypeMismatch,
+}
+```
+
+The connector automatically handles reconnection. Serialization errors will be logged and the producer will continue operating.
+```
+
+## Features
+
+| Feature | Backend |
+|---|---|
+| `std` | `rumqttc`: QoS 0-2, platform trust roots |
+| `embedded` | `mountain-mqtt` over a caller-supplied transport; `alloc` only, no executor or network stack |
+| `embedded-tls` | `mqtts://` via `embedded-tls`, on the same transport |
+| `embassy-runtime` | `embedded` plus the Embassy transport and clock |
+| `embassy-tls` | `embedded-tls` plus the SNTP time source, for a board with no RTC |
+| `critical-section-std-impl` | links a `critical-section` impl, which a std binary needs |
+| `tokio-runtime` | deprecated alias for `std` |
+| `tracing` / `defmt` | logging destinations |
+
+## Connection Management
+
+### Automatic Reconnection
+The connector automatically handles:
+- Initial connection failures
+- Network interruptions
+- Broker restarts
+
+### Backpressure
+When broker is unavailable:
+- Messages queue internally
+- Producer may block if buffer full
+- Configurable buffer size
+
+## Testing
+
+### Tokio Tests
+```bash
+# Start MQTT broker
+docker run -d -p 1883:1883 eclipse-mosquitto
+
+# Run tests
+cargo test -p aimdb-mqtt-connector --features std
+```
+
+### Embedded Tests
+
+The embedded backend runs on the host over the Tokio adapter's transport, so it
+is covered by real tests rather than a cross-compile alone:
+
+```bash
+# Host smoke: session loop, reconnect and record round-trip
+cargo test -p aimdb-mqtt-connector --no-default-features --features _test-tokio-broker --test tokio_broker
+
+# Both backends against one broker, in one process
+cargo test -p aimdb-mqtt-connector --no-default-features --features _test-backend-parity --test backend_parity
+
+# `mqtts://` against a pinned self-signed root
+cargo test -p aimdb-mqtt-connector --no-default-features --features _test-tls-broker --test tls_broker
+
+# Cross-compile check
+cargo check -p aimdb-mqtt-connector \
+    --target thumbv7em-none-eabihf \
+    --no-default-features \
+    --features embedded
+```
+
+## Examples
+
+### Multi-Record Publishing
+
+```rust
+let runtime = Arc::new(TokioAdapter::new()?);
+let mqtt = Arc::new(MqttConnector::new("mqtt://localhost:1883").await?);
+
+let mut builder = AimDbBuilder::new()
+    .runtime(runtime)
+    .with_connector("mqtt", mqtt);
+
+builder.configure::<Temperature>(|reg| {
+    reg.buffer(BufferCfg::SingleLatest)
+       .link("mqtt://sensors/temperature")
+       .with_serializer(json_serializer)
+       .finish();
+});
+
+builder.configure::<Humidity>(|reg| {
+    reg.buffer(BufferCfg::SingleLatest)
+       .link("mqtt://sensors/humidity")
+       .with_serializer(json_serializer)
+       .finish();
+});
+
+builder.configure::<Pressure>(|reg| {
+    reg.buffer(BufferCfg::SingleLatest)
+       .link("mqtt://sensors/pressure")
+       .with_serializer(json_serializer)
+       .finish();
+});
+```
+
+### Custom QoS per Record
+
+```rust
+builder.configure::<HighPriorityAlert>(|reg| {
+    reg.buffer(BufferCfg::SingleLatest)
+       .link("mqtt://alerts/critical")
+       .with_qos(2)         // QoS 2 - ExactlyOnce
+       .with_retain(true)
+       .with_serializer(json_serializer)
+       .finish();
+});
+
+builder.configure::<SensorTelemetry>(|reg| {
+    reg.buffer(BufferCfg::SpmcRing { capacity: 100 })
+       .link("mqtt://telemetry/raw")
+       .with_qos(0)         // QoS 0 - AtMostOnce
+       .with_retain(false)
+       .with_serializer(json_serializer)
+       .finish();
+});
+```
+
+## Complete Examples
+
+See repository examples:
+- `examples/tokio-mqtt-connector-demo` - Full Tokio MQTT integration
+- `examples/embassy-mqtt-connector-demo` - RP2040 with WiFi MQTT
+
+## Documentation
+
+Generate API docs:
+```bash
+cargo doc -p aimdb-mqtt-connector --open
+```
+
+## License
+
+See [LICENSE](../LICENSE) file.

@@ -1,0 +1,111 @@
+//! Integration coverage for `SyncProducer::set_value` (feature `data-contracts`):
+//! construct via `Settable::set`, produce, and consume end-to-end through the
+//! real sync bridge.
+
+#![cfg(all(feature = "std", feature = "data-contracts"))]
+
+use aimdb_core::{buffer::BufferCfg, AimDbBuilder};
+use aimdb_data_contracts::{SchemaType, Settable};
+use aimdb_sync::AimDbBuilderSyncExt;
+use aimdb_tokio_adapter::{TokioAdapter, TokioRecordRegistrarExt};
+use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Debug, Clone, PartialEq)]
+struct Temperature {
+    celsius: f32,
+    timestamp: u64,
+}
+
+impl SchemaType for Temperature {
+    const NAME: &'static str = "sync_settable.temperature";
+}
+
+impl Settable for Temperature {
+    type Value = f32;
+
+    fn set(value: Self::Value, timestamp: u64) -> Self {
+        Temperature {
+            celsius: value,
+            timestamp,
+        }
+    }
+}
+
+#[test]
+fn set_value_constructs_produces_and_is_consumed() {
+    let key_temperature_1 = aimdb_core::Name::<Temperature>::new("temperature");
+    let adapter = Arc::new(TokioAdapter);
+    let mut builder = AimDbBuilder::new().runtime(adapter);
+
+    builder.configure(key_temperature_1, |reg| {
+        reg.buffer(BufferCfg::SpmcRing { capacity: 10 })
+            .tap(|_ctx, _consumer| async move {});
+    });
+
+    let handle = builder.attach().expect("failed to attach");
+    let producer = handle
+        .producer(key_temperature_1)
+        .expect("failed to create producer");
+    let mut consumer = handle
+        .consumer(key_temperature_1)
+        .expect("failed to create consumer");
+
+    producer.set_value(22.5).expect("set_value should succeed");
+
+    let received = consumer
+        .get_with_timeout(Duration::from_secs(2))
+        .expect("failed to consume");
+
+    assert_eq!(received.value.celsius, 22.5);
+    assert!(received.value.timestamp > 0, "timestamp should be stamped");
+
+    handle.detach().expect("failed to detach");
+}
+
+#[test]
+fn set_value_at_stamps_the_explicit_timestamp() {
+    let key_temperature_2 = aimdb_core::Name::<Temperature>::new("temperature");
+    let adapter = Arc::new(TokioAdapter);
+    let mut builder = AimDbBuilder::new().runtime(adapter);
+
+    builder.configure(key_temperature_2, |reg| {
+        reg.buffer(BufferCfg::SpmcRing { capacity: 10 })
+            .tap(|_ctx, _consumer| async move {});
+    });
+
+    let handle = builder.attach().expect("failed to attach");
+    let producer = handle
+        .producer(key_temperature_2)
+        .expect("failed to create producer");
+    let mut consumer = handle
+        .consumer(key_temperature_2)
+        .expect("failed to create consumer");
+
+    // Explicit timestamp, not wall-clock — deterministic regardless of when the
+    // test runs (the replay/testing use case).
+    producer
+        .set_value_at(22.5, 1_700_000_000_000)
+        .expect("set_value_at should succeed");
+
+    let received = consumer
+        .get_with_timeout(Duration::from_secs(2))
+        .expect("failed to consume");
+
+    // The contract's measurement time is application data; the write stamp
+    // is separate (design 058 §1).
+    assert_eq!(
+        received.value,
+        Temperature {
+            celsius: 22.5,
+            timestamp: 1_700_000_000_000,
+        }
+    );
+}
+
+#[test]
+fn settable_set_is_a_pure_deterministic_constructor() {
+    let a = Temperature::set(22.5, 1_700_000_000_000);
+    let b = Temperature::set(22.5, 1_700_000_000_000);
+    assert_eq!(a, b);
+}

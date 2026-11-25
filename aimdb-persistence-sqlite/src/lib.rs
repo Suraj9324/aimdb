@@ -1,0 +1,552 @@
+//! # aimdb-persistence-sqlite
+//!
+//! SQLite persistence backend for AimDB.
+//!
+//! Owns a dedicated OS thread that holds the `rusqlite::Connection`. All async
+//! callers send `DbCommand` messages via `std::sync::mpsc::sync_channel` and
+//! await a `tokio::sync::oneshot` reply. The async executor is never blocked;
+//! the writer thread is never awaited.
+//!
+//! **Runtime requirement:** This crate requires a Tokio runtime for the
+//! `oneshot` reply channel. Do **not** use `SqliteBackend` with the Embassy
+//! adapter — it will not compile without a Tokio executor.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use aimdb_persistence_sqlite::SqliteBackend;
+//! use std::sync::Arc;
+//!
+//! # fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//! let backend = Arc::new(SqliteBackend::new("./data/history.db")?);
+//! # Ok(())
+//! # }
+//! ```
+
+mod events;
+
+use crate::events::{report, SqliteEvent};
+
+use std::path::Path;
+
+use aimdb_persistence::backend::{BoxFuture, PersistenceBackend, QueryParams, StoredValue};
+use aimdb_persistence::error::PersistenceError;
+use aimdb_persistence::{literal_prefix, prefix_upper_bound, topic_matches};
+use rusqlite::{params, Connection};
+use serde_json::Value;
+
+// ---------------------------------------------------------------------------
+// Command enum — sent from async callers to the writer thread
+// ---------------------------------------------------------------------------
+
+enum DbCommand {
+    Store {
+        record_name: String,
+        json: String,
+        timestamp: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), PersistenceError>>,
+    },
+    Query {
+        pattern: String,
+        params: QueryParams,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<StoredValue>, PersistenceError>>,
+    },
+    Cleanup {
+        older_than: u64,
+        reply: tokio::sync::oneshot::Sender<Result<u64, PersistenceError>>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// SqliteBackend — the public API
+// ---------------------------------------------------------------------------
+
+/// SQLite persistence backend.
+///
+/// `Clone` is cheap — it only clones the `mpsc::SyncSender` handle.
+///
+/// The writer thread shuts down automatically when all `SyncSender` handles
+/// (i.e. all `SqliteBackend` clones) are dropped.
+#[derive(Clone)]
+pub struct SqliteBackend {
+    tx: std::sync::mpsc::SyncSender<DbCommand>,
+}
+
+impl SqliteBackend {
+    /// Opens (or creates) a SQLite database at `path` and starts the writer thread.
+    ///
+    /// Schema and WAL mode are configured **synchronously** here — no `block_on`
+    /// needed, no async runtime required at construction time.
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, PersistenceError> {
+        // Bound of 64 provides backpressure without being too aggressive.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DbCommand>(64);
+
+        let conn = Connection::open(path).map_err(|e| PersistenceError::Backend(e.to_string()))?;
+
+        // Enable WAL mode: readers and the single writer proceed concurrently.
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| PersistenceError::Backend(e.to_string()))?;
+
+        // Initialize schema before the writer thread is spawned.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS record_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                record_name TEXT    NOT NULL,
+                value_json  TEXT    NOT NULL,
+                stored_at   INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_record_time
+                ON record_history(record_name, stored_at DESC);",
+        )
+        .map_err(|e| PersistenceError::Backend(e.to_string()))?;
+
+        std::thread::Builder::new()
+            .name("aimdb-sqlite".to_string())
+            .spawn(move || run_db_thread(conn, rx))
+            .map_err(|e| PersistenceError::Backend(e.to_string()))?;
+
+        Ok(Self { tx })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Writer thread — blocking event loop
+// ---------------------------------------------------------------------------
+
+fn run_db_thread(conn: Connection, rx: std::sync::mpsc::Receiver<DbCommand>) {
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            DbCommand::Store {
+                record_name,
+                json,
+                timestamp,
+                reply,
+            } => {
+                let ts = match i64::try_from(timestamp) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let _ = reply.send(Err(PersistenceError::Backend(format!(
+                            "timestamp {timestamp} overflows i64"
+                        ))));
+                        continue;
+                    }
+                };
+                let result = conn
+                    .prepare_cached(
+                        "INSERT INTO record_history (record_name, value_json, stored_at)
+                         VALUES (?1, ?2, ?3)",
+                    )
+                    .and_then(|mut stmt| stmt.execute(params![record_name, json, ts]))
+                    .map(|_| ())
+                    .map_err(|e| PersistenceError::Backend(e.to_string()));
+                let _ = reply.send(result);
+            }
+
+            DbCommand::Query {
+                pattern,
+                params,
+                reply,
+            } => {
+                let result = query_sync(&conn, &pattern, params);
+                let _ = reply.send(result);
+            }
+
+            DbCommand::Cleanup { older_than, reply } => {
+                let cutoff = match i64::try_from(older_than) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let _ = reply.send(Err(PersistenceError::Backend(format!(
+                            "cleanup cutoff {older_than} overflows i64"
+                        ))));
+                        continue;
+                    }
+                };
+                let result = conn
+                    .prepare_cached("DELETE FROM record_history WHERE stored_at < ?1")
+                    .and_then(|mut stmt| stmt.execute(params![cutoff]))
+                    .map(|n| n as u64)
+                    .map_err(|e| PersistenceError::Backend(e.to_string()));
+                let _ = reply.send(result);
+            }
+        }
+    }
+    // All SyncSender handles dropped → exit cleanly.
+}
+
+// ---------------------------------------------------------------------------
+// SQL helpers
+// ---------------------------------------------------------------------------
+
+/// Half-open `record_name` range covering every key `pattern` can match, as
+/// `(lower, upper)`; `None` on either side is unbounded.
+///
+/// A prefilter, not the pattern — the wildcards are left to [`topic_matches`]. A
+/// range rather than `LIKE` because SQLite's `LIKE` is ASCII-case-insensitive, so
+/// it both disagrees with that matcher and cannot use `idx_record_time` (BINARY).
+fn scan_range(pattern: &str) -> (Option<String>, Option<Vec<u8>>) {
+    let prefix = literal_prefix(pattern);
+    if prefix.is_empty() {
+        return (None, None);
+    }
+    (Some(prefix.to_string()), prefix_upper_bound(prefix))
+}
+
+fn query_sync(
+    conn: &Connection,
+    pattern: &str,
+    params: QueryParams,
+) -> Result<Vec<StoredValue>, PersistenceError> {
+    // `None` means "no limit" — the SQL uses `(?4 IS NULL OR rn <= ?4)`.
+    let limit: Option<i64> = params
+        .limit_per_record
+        .map(|l| {
+            i64::try_from(l).map_err(|_| {
+                PersistenceError::Backend("limit_per_record overflows i64".to_string())
+            })
+        })
+        .transpose()?;
+    let (scan_from, scan_until) = scan_range(pattern);
+
+    // Checked conversion: timestamps must fit in SQLite's signed i64.
+    let start_time: Option<i64> = params
+        .start_time
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| PersistenceError::Backend("start_time overflows i64".to_string()))?;
+    let end_time: Option<i64> = params
+        .end_time
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| PersistenceError::Backend("end_time overflows i64".to_string()))?;
+
+    let mut stmt = conn
+        .prepare_cached(
+            "WITH ranked AS (
+                SELECT record_name, value_json, stored_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY record_name
+                           ORDER BY stored_at DESC, id DESC
+                       ) AS rn
+                FROM record_history
+                WHERE (?1 IS NULL OR record_name >= ?1)
+                  AND (?5 IS NULL OR record_name < CAST(?5 AS TEXT))
+                  AND (?2 IS NULL OR stored_at >= ?2)
+                  AND (?3 IS NULL OR stored_at <= ?3)
+            )
+            SELECT record_name, value_json, stored_at
+            FROM ranked WHERE (?4 IS NULL OR rn <= ?4)
+            ORDER BY record_name, stored_at DESC",
+        )
+        .map_err(|e| PersistenceError::Backend(e.to_string()))?;
+
+    let rows = stmt
+        .query_map(
+            rusqlite::params![scan_from, start_time, end_time, limit, scan_until],
+            |row| {
+                let value_str: String = row.get(1)?;
+                Ok(StoredValue {
+                    record_name: row.get(0)?,
+                    value: serde_json::from_str(&value_str).unwrap_or_else(|e| {
+                        report(SqliteEvent::CorruptJson { error: &e });
+                        Value::Null
+                    }),
+                    stored_at: row.get::<_, i64>(2).map(|v| v.max(0) as u64)?,
+                })
+            },
+        )
+        .map_err(|e| PersistenceError::Backend(e.to_string()))?;
+
+    // The range only narrowed; the wildcards apply here. A drop takes a whole
+    // record, so the per-record `rn <= limit` still holds for those that survive.
+    let mut matched = Vec::new();
+    for row in rows {
+        let row = row.map_err(|e| PersistenceError::Backend(e.to_string()))?;
+        if topic_matches(pattern, &row.record_name) {
+            matched.push(row);
+        }
+    }
+    Ok(matched)
+}
+
+// ---------------------------------------------------------------------------
+// send_cmd! macro — enqueue + await oneshot
+// ---------------------------------------------------------------------------
+
+macro_rules! send_cmd {
+    ($tx:expr, $cmd:expr) => {{
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        $tx.send($cmd(reply_tx))
+            .map_err(|_| PersistenceError::BackendShutdown)?;
+        reply_rx
+            .await
+            .map_err(|_| PersistenceError::BackendShutdown)?
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// PersistenceBackend impl
+// ---------------------------------------------------------------------------
+
+impl PersistenceBackend for SqliteBackend {
+    // initialize() — uses trait default (no-op); schema was created in ::new().
+
+    fn store<'a>(
+        &'a self,
+        record_name: &'a str,
+        value: &'a Value,
+        timestamp: u64,
+    ) -> BoxFuture<'a, Result<(), PersistenceError>> {
+        let json = match serde_json::to_string(value) {
+            Ok(j) => j,
+            Err(e) => return Box::pin(async move { Err(PersistenceError::from(e)) }),
+        };
+        let record_name = record_name.to_string();
+        let tx = self.tx.clone();
+        Box::pin(async move {
+            send_cmd!(tx, |reply| DbCommand::Store {
+                record_name,
+                json,
+                timestamp,
+                reply,
+            })
+        })
+    }
+
+    fn query<'a>(
+        &'a self,
+        record_pattern: &'a str,
+        params: QueryParams,
+    ) -> BoxFuture<'a, Result<Vec<StoredValue>, PersistenceError>> {
+        let pattern = record_pattern.to_string();
+        let tx = self.tx.clone();
+        Box::pin(async move {
+            send_cmd!(tx, |reply| DbCommand::Query {
+                pattern,
+                params,
+                reply,
+            })
+        })
+    }
+
+    fn cleanup(&self, older_than: u64) -> BoxFuture<'_, Result<u64, PersistenceError>> {
+        let tx = self.tx.clone();
+        Box::pin(async move { send_cmd!(tx, |reply| DbCommand::Cleanup { older_than, reply }) })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_store_and_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let backend = SqliteBackend::new(&db_path).unwrap();
+
+        // Store a value
+        let value = serde_json::json!({"celsius": 21.5, "city": "vienna"});
+        backend.store("temp.vienna", &value, 1000).await.unwrap();
+        backend.store("temp.vienna", &value, 2000).await.unwrap();
+        backend.store("temp.berlin", &value, 1500).await.unwrap();
+
+        // Query latest 1 per record with wildcard
+        let results = backend
+            .query(
+                "temp.*",
+                QueryParams {
+                    limit_per_record: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2); // 1 per city
+        assert!(results.iter().any(|r| r.record_name == "temp.vienna"));
+        assert!(results.iter().any(|r| r.record_name == "temp.berlin"));
+
+        // The vienna result should be the latest (timestamp 2000)
+        let vienna = results
+            .iter()
+            .find(|r| r.record_name == "temp.vienna")
+            .unwrap();
+        assert_eq!(vienna.stored_at, 2000);
+    }
+
+    #[tokio::test]
+    async fn test_time_range_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_range.db");
+        let backend = SqliteBackend::new(&db_path).unwrap();
+
+        let value = serde_json::json!({"celsius": 20.0});
+        for ts in [1000u64, 2000, 3000, 4000, 5000] {
+            backend.store("temp.vienna", &value, ts).await.unwrap();
+        }
+
+        let results = backend
+            .query(
+                "temp.vienna",
+                QueryParams {
+                    start_time: Some(2000),
+                    end_time: Some(4000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3); // timestamps 2000, 3000, 4000
+    }
+
+    #[tokio::test]
+    async fn test_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_cleanup.db");
+        let backend = SqliteBackend::new(&db_path).unwrap();
+
+        let value = serde_json::json!({"celsius": 20.0});
+        backend.store("temp.a", &value, 1000).await.unwrap();
+        backend.store("temp.b", &value, 2000).await.unwrap();
+        backend.store("temp.c", &value, 3000).await.unwrap();
+
+        // Delete rows older than 2500
+        let deleted = backend.cleanup(2500).await.unwrap();
+        assert_eq!(deleted, 2); // 1000 and 2000
+
+        // Only the 3000 row remains
+        let results = backend
+            .query(
+                "temp.*",
+                QueryParams {
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].stored_at, 3000);
+    }
+
+    #[tokio::test]
+    async fn test_pattern_escaping() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_escape.db");
+        let backend = SqliteBackend::new(&db_path).unwrap();
+
+        let value = serde_json::json!({"ok": true});
+        backend.store("test_record", &value, 1000).await.unwrap();
+        backend.store("testXrecord", &value, 1000).await.unwrap();
+
+        // Exact match — the `_` in the record name should NOT match `X`
+        let results = backend
+            .query(
+                "test_record",
+                QueryParams {
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].record_name, "test_record");
+    }
+
+    /// `*` is one segment, so a query cannot reach past its own depth —
+    /// `sensors.secret.deep` sits inside the scan range, and only the matcher
+    /// keeps it out.
+    #[tokio::test]
+    async fn a_single_level_query_does_not_return_deeper_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("depth.db");
+        let backend = SqliteBackend::new(&db_path).unwrap();
+
+        let value = serde_json::json!({"v": 1});
+        backend.store("sensors.public", &value, 1000).await.unwrap();
+        backend
+            .store("sensors.secret.deep", &value, 1000)
+            .await
+            .unwrap();
+
+        let results = backend
+            .query("sensors.*", QueryParams::default())
+            .await
+            .unwrap();
+
+        let names: Vec<&str> = results.iter().map(|r| r.record_name.as_str()).collect();
+        assert_eq!(names, ["sensors.public"]);
+    }
+
+    /// `#` spans segments — it once reached SQLite as a literal, matching nothing.
+    #[tokio::test]
+    async fn a_multi_level_query_spans_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("multi.db");
+        let backend = SqliteBackend::new(&db_path).unwrap();
+
+        let value = serde_json::json!({"v": 1});
+        backend.store("sensors.public", &value, 1000).await.unwrap();
+        backend
+            .store("sensors.secret.deep", &value, 1000)
+            .await
+            .unwrap();
+        // A key that merely *starts with* the prefix string is a different record.
+        backend
+            .store("sensors_extra.x", &value, 1000)
+            .await
+            .unwrap();
+
+        let results = backend
+            .query("sensors.#", QueryParams::default())
+            .await
+            .unwrap();
+
+        let mut names: Vec<&str> = results.iter().map(|r| r.record_name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["sensors.public", "sensors.secret.deep"]);
+    }
+
+    /// The matcher is case-sensitive; `LIKE` was not.
+    #[tokio::test]
+    async fn matching_is_case_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("case.db");
+        let backend = SqliteBackend::new(&db_path).unwrap();
+
+        let value = serde_json::json!({"v": 1});
+        backend.store("Sensors.temp", &value, 1000).await.unwrap();
+
+        let results = backend
+            .query("sensors.*", QueryParams::default())
+            .await
+            .unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn corrupted_json_reports_before_substituting_null_on_a_worker_thread() {
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observer = {
+            let seen = seen.clone();
+            std::sync::Arc::new(move |event: &SqliteEvent<'_>| {
+                let SqliteEvent::CorruptJson { error } = event;
+                assert!(error.to_string().contains("expected"));
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        let rows = std::thread::spawn(move || events::capture::with(observer, || {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE record_history (id INTEGER PRIMARY KEY, record_name TEXT, value_json TEXT, stored_at INTEGER); INSERT INTO record_history VALUES (1, 'broken', 'invalid', 7);").unwrap();
+            query_sync(&conn, "#", QueryParams::default()).unwrap()
+        })).join().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value, Value::Null);
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+}

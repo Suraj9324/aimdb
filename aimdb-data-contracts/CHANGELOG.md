@@ -1,0 +1,136 @@
+# Changelog
+
+All notable changes to `aimdb-data-contracts` will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Breaking — typed record keys (design 063)
+
+- Add Key<T>; contract identity comes from SchemaType. Link and observation helpers require the schema declared by the key: `publish`, `subscribe`, `linked_to`, `linked_from`, their `_with` forms and `observe` do not compile on a record declared with `Name<T>` or `payload = T`. `publish` / `subscribe` return `ContractOutboundLink` / `ContractInboundLink`. `LinkableRegistrarExt`, `LinkCodecRegistrarExt` and `ObservableRegistrarExt` take the registrar's schema state as a third parameter and return `&mut Self`.
+
+### Changed — value envelopes (design 062)
+
+- `MigrationChain` now takes explicit versions and generic payload codecs:
+  `migrate_from`, `migrate_into`, and `shape_of` replace the JSON probe APIs.
+  `migration_chain!` rejects `version_field` and generates `Reaches<V>` and
+  `VersionOf<T>` proofs. `catalog!` requires a seed `aimdb.lock`, exposes locked
+  `ContractShape` values, and rejects contract name-ID collisions.
+  `MigrationError::DeserializationFailed` is now `{ target, reason }` and keeps
+  the decoder's message, so ingest rejections say why a payload failed.
+- Link declarations add `with_envelope`, `with_contract`, `accepts_from`,
+  `sends_as`, and `without_shape`. Built-in codecs use normal `with_link_codec`;
+  generic custom codecs use `with_versioned_codec`. Shared admission validates
+  metadata before a single decode.
+- **Inbound links reject leftover bytes:** one frame carries exactly one value.
+  Postcard and CDR links (plain `with_link_codec`, inline, bound, and
+  `#[derive(RosMessage)]` types) used to ignore trailing data and now count it
+  as `decode_error`. CDR padding declared in the encapsulation header is
+  accepted. A sender that pads frames must stop, or declare the padding.
+- Payload `schema_version` fields are ordinary data. New payloads omit them;
+  changing an already locked layout still requires a new version.
+
+### Added
+
+- **`catalog!` and `aimdb.lock` (#410).** `catalog! { contracts: [..],
+  helpers: [..] }` lists a contracts crate's contracts (`CATALOG`, `no_std`)
+  and the enums nested in them, and generates a test that locks the wire
+  shape of every `NAME@VERSION` in a committed `aimdb.lock`. A shape changed
+  without a `VERSION` bump always fails; new and removed entries are
+  accepted with `AIMDB_UPDATE_LOCK=1 cargo test`. Shapes are traced with
+  `serde-reflection` for a supported profile of contracts; contracts outside
+  it fail the check. Behind the `lock` feature, meant for
+  `[dev-dependencies]` only.
+
+## [0.3.0] - 2026-11-03
+
+### Added
+
+- **`publish(handle, address)` / `subscribe(handle, address)` (#391)** for
+  `Linkable` contracts: a link in the contract's own codec that reports its
+  schema, for `reg.output(..)` / `reg.input(..)`. Connector options apply as
+  on any link. `linked_to` / `linked_from` now share their implementation,
+  unchanged in behaviour. A type that is not `Linkable` gets a readable
+  compile error.
+- `LinkCodecBuilderExt::with_link_codec` also applies to detached links
+  (`OutboundLink` / `InboundLink`, #389).
+
+- **Records report their contract's schema to core (#332).** `linked_to`,
+  `linked_from`, `linked_*_with` and `observe` set the record's schema to
+  `T::NAME`/`T::VERSION` (`RecordRegistrar::schema`), so `graph.nodes` and
+  `record.list` show it. `SchemaRegistrarExt::contract_schema()` sets it for
+  records with neither, available whenever `aimdb-core` is enabled.
+
+- **`WireFormat`** (`Unspecified`, `Json`, `Postcard`, `Cdr`) and the defaulted
+  constants `Linkable::WIRE_FORMAT` and `LinkCodec::WIRE_FORMAT`. The codec
+  verbs (`linked_to`, `linked_from`, `linked_*_with`, `with_link_codec`)
+  record the codec's format on the link under core's `WIRE_FORMAT_KEY`;
+  `WireFormat::recorded_in` reads it back. Existing impls compile unchanged.
+- **`ros2` feature: `RosMessage`**, a `Linkable` whose encoding is the type's
+  ROS 2 CDR form, with `ROS_TYPE_NAME` (DDS form, `pkg::msg::dds_::Name_`)
+  and `ROS_TYPE_HASH` (`RIHS01_…`). `ros2::dds_type_name`,
+  `ros2::validate_dds_type_name` and `ros2::validate_type_hash` check the
+  names (`RosNameError`); `#[derive(RosMessage)]` is re-exported. Implies
+  `linkable-cdr`.
+- **`linkable-cdr` feature: `link_codecs::Cdr<N>`**, CDR (XCDR1) through
+  `aimdb-cdr` on any link: a bounded encode into an `N`-byte scratch
+  (default 256), both byte orders on decode, `cdr` recorded on the link.
+
+## [0.2.0] - 2026-09-18
+
+### Changed (breaking) — Design 041: capability traits as first-class verbs
+
+- **`Simulatable` reshaped for compile-time-only simulation.** `simulate<R>(config: &SimulationConfig, ...)` → `simulate<R>(params: &Self::Params, ...)` with a new associated `type Params`. `SimulationConfig` (including its runtime `enabled` gate) and `SimulationParams` are removed; `SimProfile<P> { interval_ms, params }` and off-the-shelf `RandomWalkParams` replace them (`type Params = RandomWalkParams` is the migration path for existing scalar-walk impls). `simulatable` now also requires `aimdb-core` (for the new `SimulatableRegistrarExt`) and `rand` drops the `std_rng` feature (RNG is always caller-supplied).
+- **`Observable` loses `ICON` and `format_log()`.** The trait is now numeric-projection-only: `type Signal`, `const SIGNAL` (defaults to `Self::NAME`), `const UNIT`, `fn signal()`. Presentation moved to `ObservableRegistrarExt::log(node_id)`.
+- **`Settable` moves behind a new `settable` feature** (was compiled unconditionally) for tier symmetry with the other wire contracts.
+- **`linkable` is now format-neutral.** It enables only the `Linkable` trait, registrar verbs, `alloc`, and `aimdb-core`; it no longer pulls `serde_json` or re-exports the JSON `#[derive(Linkable)]`. Existing derive users must enable the new `linkable-json` feature. Manual Postcard/custom implementations stay on base `linkable`, so their normal dependency graph is JSON-free (#155).
+
+### Added
+
+- **Issue #178 — per-link codec selection.** `LinkCodec<T>`, `LinkCodecBuilderExt::with_link_codec` and `LinkCodecRegistrarExt::{linked_from_with, linked_to_with}` let the same record type use different formats on different connector routes without a runtime registry. Built-in `link_codecs::Json` and bounded `link_codecs::Postcard<N>` markers are feature-gated by `linkable-json` and the new `linkable-postcard`; Postcard reuses the route-local scratch and owned overflow fallback added for issue #177. Existing `.linked_from` and `.linked_to` behavior is unchanged. Repeated `with_link_codec` calls use complete last-selection-wins semantics: an owned-only replacement clears a scratch encoder left by an earlier bounded codec.
+- **Issue #177 — `Linkable::encode_into(&mut [u8])`.** Existing implementations remain source-compatible through a checked `to_bytes`-and-copy default. A new `ENCODE_BUFFER_CAPACITY` associated constant lets implementations advertise a real allocation-free override; `linked_to` then installs the core's reusable scratch-buffer fast path while retaining `to_bytes` for oversized values. The new method reuses `aimdb_core::connector::SerializeError`; no additional codec error type is introduced. The older `from_bytes`/`to_bytes` `String` errors remain unchanged under the compatibility-first decision.
+- `SimulatableRegistrarExt::simulate(profile, rng)` — installs a `.source()` loop emitting `T::simulate(...)` on a timer.
+- `ObservableRegistrarExt::observe()` — feeds `T::signal()` into a core signal gauge (last/min/max/mean), surfaced on `record.list`/`record.get`/stage profiling; `ObservableRegistrarExt::log(node_id)` for the console-logging path (replaces the old `format_log`).
+- `LinkableRegistrarExt::linked_from(url)` / `linked_to(url)` — one-line `.link_from()`/`.link_to()` wiring defaulted to `T::from_bytes`/`T::to_bytes`. `linkable` now also requires `aimdb-core`.
+- `linkable-json` — layers `serde_json` and the JSON `#[derive(Linkable)]` convenience over the format-neutral `linkable` contract; `no_std + alloc` compatible.
+
+### Changed
+
+- **`migratable` no longer requires `std`.** `migratable = ["alloc", "serde_json"]` (was `["std", "serde_json"]`); the crate's `serde_json` dependency now follows the workspace pin (`default-features = false, features = ["alloc"]`) instead of pulling in `serde_json/std` by default. `migration_chain!` and both `Linkable`-with-migration patterns now compile on `no_std + alloc` (e.g. `thumbv7em-none-eabihf`). A crate that enabled only `migratable` and relied on it transitively activating `std` will need to enable `std` explicitly. In-repo consumers are unaffected (they enable `std` by default).
+- `log_tap<T, R>(ctx, consumer, node_id)` now takes `Consumer<T>` instead of `Consumer<T, R>` — `R` is still on `RuntimeContext<R>` (Design 029, M14). User-visible signature shrink only; behaviour unchanged.
+
+## [0.1.1] - 2026-05-22
+
+### Changed
+
+- **Dependency update**: Upgraded `rand` from 0.8 to 0.10.1.
+
+## [0.1.0] - 2026-03-16
+
+### Added
+
+- `Streamable` trait — capability marker for types crossing serialization boundaries (WebSocket, WASM, wire)
+- `Migratable` trait with `MigrationChain` and `MigrationStep` for schema evolution
+- Explicit version pins for path dependencies (`aimdb-core = "1.0.0"`, `aimdb-executor = "0.1.0"`)
+
+### Changed
+
+- **Breaking**: Refocused as a pure trait-definition crate
+  - Removed concrete contracts (`Temperature`, `Humidity`, `GpsLocation`) — moved to application-level crates (e.g., `weather-mesh-common`)
+  - Removed closed `StreamableVisitor` dispatcher and `for_each_streamable()` — replaced by extensible registry pattern in connector/adapter crates
+  - Removed `ts` feature and `ts-rs` dependency
+  - Version reset from 1.0.0 to 0.1.0 to reflect the reduced, stabilizing scope
+
+## [0.5.0] - 2026-02-21
+
+### Added
+
+- Initial release with shared data contract types
+- `SchemaType` trait for compile-time type identity
+- `Linkable` trait for wire format support in connector transport
+- `Simulatable` trait with `SimulationConfig` and `SimulationParams` for test data generation
+- `Observable` module with `log_tap` function for runtime observability
+- Built-in contracts: `Temperature`, `Humidity`, `GpsLocation`
+- Feature flags: `linkable`, `simulatable`, `migratable`, `observable`, `ts`

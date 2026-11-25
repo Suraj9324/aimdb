@@ -1,0 +1,1514 @@
+//! A `serve` server and a `run_client` client engine, talking over a throwaway
+//! in-memory pipe, round-trip **RPC + a streaming subscription + a
+//! fire-and-forget write** in both directions — proving the shared substrate
+//! (`Connection` / `EnvelopeCodec` / `Inbound`/`Outbound`) is genuinely
+//! role-neutral.
+//!
+//! The substrate here is deliberately throwaway: a channel-backed `Connection`
+//! (framing-in-transport: one `Vec<u8>` per logical frame), a `Listener`/
+//! `Dialer` pair over a connect channel, a tiny line-oriented `EnvelopeCodec`,
+//! and an echo `Dispatch`. The real UDS/NDJSON/AimX impls live in
+//! `aimdb-uds-connector` and `aimdb-core::session::aimx`.
+
+#![cfg(feature = "connector-session")]
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures::StreamExt;
+
+use aimdb_core::session::{
+    run_client, serve, AuthError, BoxFut, BoxStream, ClientConfig, CodecError, Connection, Dialer,
+    Dispatch, EnvelopeCodec, Inbound, Listener, OneShotDialer, OneShotListener, Outbound, Payload,
+    PeerInfo, RpcError, Session, SessionConfig, SessionCtx, SessionLimits, SubUpdate,
+    TransportError, TransportResult,
+};
+
+/// Engine-test clock (aimdb-core can't depend on a runtime adapter — that
+/// would be a cycle). These tests run with `reconnect: false` and no
+/// keepalive, so the clock seam is never awaited and the shared no-op stub
+/// suffices.
+use aimdb_core::executor::test_support::NoopRuntimeOps as TestClock;
+use aimdb_core::Stamp;
+
+// ===========================================================================
+// Channel-backed transport (Layer 1)
+// ===========================================================================
+
+/// A framed bidirectional pipe: send to the peer, receive from the peer. One
+/// `Vec<u8>` == one logical frame (framing lives in the transport).
+struct ChannelConn {
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    peer: PeerInfo,
+}
+
+fn conn_pair() -> (ChannelConn, ChannelConn) {
+    let (a_tx, a_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (b_tx, b_rx) = tokio::sync::mpsc::unbounded_channel();
+    (
+        ChannelConn {
+            tx: a_tx,
+            rx: b_rx,
+            peer: PeerInfo::default(),
+        },
+        ChannelConn {
+            tx: b_tx,
+            rx: a_rx,
+            peer: PeerInfo::default(),
+        },
+    )
+}
+
+impl Connection for ChannelConn {
+    fn recv(&mut self) -> BoxFut<'_, TransportResult<Option<Vec<u8>>>> {
+        Box::pin(async move { Ok(self.rx.recv().await) }) // None == peer closed
+    }
+    fn send<'a>(&'a mut self, frame: &'a [u8]) -> BoxFut<'a, TransportResult<()>> {
+        let tx = self.tx.clone();
+        let bytes = frame.to_vec();
+        Box::pin(async move { tx.send(bytes).map_err(|_| TransportError::Closed) })
+    }
+    fn peer(&self) -> &PeerInfo {
+        &self.peer
+    }
+}
+
+struct ChannelListener {
+    incoming: tokio::sync::mpsc::UnboundedReceiver<Box<dyn Connection>>,
+}
+
+impl Listener for ChannelListener {
+    fn accept(&mut self) -> BoxFut<'_, TransportResult<Box<dyn Connection>>> {
+        Box::pin(async move { self.incoming.recv().await.ok_or(TransportError::Closed) })
+    }
+}
+
+struct ChannelDialer {
+    connect_tx: tokio::sync::mpsc::UnboundedSender<Box<dyn Connection>>,
+}
+
+impl Dialer for ChannelDialer {
+    fn connect(&self) -> BoxFut<'_, TransportResult<Box<dyn Connection>>> {
+        let connect_tx = self.connect_tx.clone();
+        Box::pin(async move {
+            let (server_side, client_side) = conn_pair();
+            connect_tx
+                .send(Box::new(server_side) as Box<dyn Connection>)
+                .map_err(|_| TransportError::Closed)?;
+            Ok(Box::new(client_side) as Box<dyn Connection>)
+        })
+    }
+}
+
+fn transport_pair() -> (ChannelListener, ChannelDialer) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (
+        ChannelListener { incoming: rx },
+        ChannelDialer { connect_tx: tx },
+    )
+}
+
+// ===========================================================================
+// Tiny line-oriented EnvelopeCodec (symmetric: both engine directions)
+// ===========================================================================
+
+struct LineCodec;
+
+/// A frame's stamp field.
+fn stamp(s: &str) -> Result<Stamp, CodecError> {
+    s.parse()
+        .map(Stamp::from_nanos)
+        .map_err(|_| CodecError::Malformed)
+}
+
+fn payload_from(s: &str) -> Payload {
+    Arc::from(s.as_bytes())
+}
+
+fn utf8(b: &[u8]) -> Result<&str, CodecError> {
+    std::str::from_utf8(b).map_err(|_| CodecError::Malformed)
+}
+
+fn rpc_code(e: &RpcError) -> &'static str {
+    match e {
+        RpcError::NotFound => "notfound",
+        RpcError::Denied => "denied",
+        _ => "internal",
+    }
+}
+
+fn code_rpc(s: &str) -> RpcError {
+    match s {
+        "notfound" => RpcError::NotFound,
+        "denied" => RpcError::Denied,
+        _ => RpcError::Internal,
+    }
+}
+
+impl EnvelopeCodec for LineCodec {
+    // --- server direction --------------------------------------------------
+    fn decode(&self, frame: &[u8]) -> Result<Inbound, CodecError> {
+        let s = utf8(frame)?;
+        let (tag, rest) = s.split_once('\n').unwrap_or((s, ""));
+        match tag {
+            "REQ" => {
+                let (id, r) = rest.split_once('\n').ok_or(CodecError::Malformed)?;
+                let (method, params) = r.split_once('\n').unwrap_or((r, ""));
+                Ok(Inbound::Request {
+                    id: id.parse().map_err(|_| CodecError::Malformed)?,
+                    method: method.to_string(),
+                    params: payload_from(params),
+                })
+            }
+            "SUB" => {
+                let (id, topic) = rest.split_once('\n').ok_or(CodecError::Malformed)?;
+                Ok(Inbound::Subscribe {
+                    id: id.parse().map_err(|_| CodecError::Malformed)?,
+                    topic: topic.to_string(),
+                })
+            }
+            "UNSUB" => Ok(Inbound::Unsubscribe {
+                sub: rest.to_string(),
+            }),
+            "WRITE" => {
+                let (topic, payload) = rest.split_once('\n').unwrap_or((rest, ""));
+                Ok(Inbound::Write {
+                    topic: topic.to_string(),
+                    payload: payload_from(payload),
+                })
+            }
+            "PING" => Ok(Inbound::Ping),
+            _ => Err(CodecError::Malformed),
+        }
+    }
+
+    fn encode(&self, msg: Outbound<'_>, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        let s = match msg {
+            Outbound::Reply { id, result } => match result {
+                Ok(data) => format!("REPLY\n{}\nOK\n{}", id, utf8(&data)?),
+                Err(e) => format!("REPLY\n{}\nERR\n{}", id, rpc_code(&e)),
+            },
+            Outbound::Event {
+                sub,
+                seq,
+                topic,
+                ts,
+                data,
+            } => {
+                // `-` marks an untagged event (no per-record topic).
+                format!(
+                    "EVENT\n{}\n{}\n{}\n{}\n{}",
+                    sub,
+                    seq,
+                    ts.as_nanos(),
+                    topic.unwrap_or("-"),
+                    utf8(&data)?
+                )
+            }
+            Outbound::Snapshot {
+                sub,
+                seq,
+                last,
+                topic,
+                ts,
+                data,
+            } => {
+                // `L` marks the burst's final snapshot, `-` a mid-burst one.
+                format!(
+                    "SNAP\n{}\n{}\n{}\n{}\n{}\n{}",
+                    sub,
+                    seq,
+                    if last { "L" } else { "-" },
+                    ts.as_nanos(),
+                    topic,
+                    utf8(&data)?
+                )
+            }
+            Outbound::Pong => "PONG".to_string(),
+            Outbound::Subscribed { sub } => format!("SUBSCRIBED\n{}", sub),
+        };
+        out.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+
+    // --- client direction (dual) -------------------------------------------
+    fn encode_inbound(&self, msg: Inbound, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        let s = match msg {
+            Inbound::Request { id, method, params } => {
+                format!("REQ\n{}\n{}\n{}", id, method, utf8(&params)?)
+            }
+            Inbound::Subscribe { id, topic } => format!("SUB\n{}\n{}", id, topic),
+            Inbound::Unsubscribe { sub } => format!("UNSUB\n{}", sub),
+            Inbound::Write { topic, payload } => format!("WRITE\n{}\n{}", topic, utf8(&payload)?),
+            Inbound::Ping => "PING".to_string(),
+        };
+        out.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+
+    fn decode_outbound<'a>(&self, frame: &'a [u8]) -> Result<Outbound<'a>, CodecError> {
+        let s = utf8(frame)?;
+        let (tag, rest) = s.split_once('\n').unwrap_or((s, ""));
+        match tag {
+            "REPLY" => {
+                let (id, r) = rest.split_once('\n').ok_or(CodecError::Malformed)?;
+                let (kind, tail) = r.split_once('\n').unwrap_or((r, ""));
+                let result = match kind {
+                    "OK" => Ok(payload_from(tail)),
+                    "ERR" => Err(code_rpc(tail)),
+                    _ => return Err(CodecError::Malformed),
+                };
+                Ok(Outbound::Reply {
+                    id: id.parse().map_err(|_| CodecError::Malformed)?,
+                    result,
+                })
+            }
+            "EVENT" => {
+                let (sub, r) = rest.split_once('\n').ok_or(CodecError::Malformed)?;
+                let (seq, r) = r.split_once('\n').ok_or(CodecError::Malformed)?;
+                let (ts, r) = r.split_once('\n').ok_or(CodecError::Malformed)?;
+                let (topic, data) = r.split_once('\n').unwrap_or((r, ""));
+                Ok(Outbound::Event {
+                    sub,
+                    seq: seq.parse().map_err(|_| CodecError::Malformed)?,
+                    topic: (topic != "-").then_some(topic),
+                    ts: stamp(ts)?,
+                    data: payload_from(data),
+                })
+            }
+            "SNAP" => {
+                let (sub, r) = rest.split_once('\n').ok_or(CodecError::Malformed)?;
+                let (seq, r) = r.split_once('\n').ok_or(CodecError::Malformed)?;
+                let (last, r) = r.split_once('\n').ok_or(CodecError::Malformed)?;
+                let (ts, r) = r.split_once('\n').ok_or(CodecError::Malformed)?;
+                let (topic, data) = r.split_once('\n').unwrap_or((r, ""));
+                Ok(Outbound::Snapshot {
+                    sub,
+                    seq: seq.parse().map_err(|_| CodecError::Malformed)?,
+                    last: last == "L",
+                    topic,
+                    ts: stamp(ts)?,
+                    data: payload_from(data),
+                })
+            }
+            "PONG" => Ok(Outbound::Pong),
+            _ => Err(CodecError::Malformed),
+        }
+    }
+}
+
+// ===========================================================================
+// Echo dispatch (Layer 3)
+// ===========================================================================
+
+/// Shared log of `(topic, payload)` writes the server received, for assertion.
+type WriteLog = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+struct EchoDispatch {
+    writes: WriteLog,
+}
+
+impl Dispatch for EchoDispatch {
+    fn authenticate<'a>(
+        &'a self,
+        _peer: &'a PeerInfo,
+        _first: Option<&'a [u8]>,
+    ) -> BoxFut<'a, Result<SessionCtx, AuthError>> {
+        Box::pin(async { Ok(SessionCtx::default()) })
+    }
+
+    fn open(&self, _ctx: &SessionCtx) -> Box<dyn Session> {
+        Box::new(EchoSession {
+            writes: self.writes.clone(),
+        })
+    }
+}
+
+/// Per-connection echo session — the shared `EchoDispatch` clones its write log
+/// into each one at `open` time.
+struct EchoSession {
+    writes: WriteLog,
+}
+
+impl Session for EchoSession {
+    fn call<'a>(
+        &'a mut self,
+        _method: &'a str,
+        params: Payload,
+    ) -> BoxFut<'a, Result<Payload, RpcError>> {
+        // Echo the params straight back.
+        Box::pin(async move { Ok(params) })
+    }
+
+    fn subscribe<'a>(
+        &'a mut self,
+        topic: &'a str,
+    ) -> BoxFut<'a, Result<BoxStream<'static, SubUpdate>, RpcError>> {
+        let topic = topic.to_string();
+        Box::pin(async move {
+            // Sentinel: let a known topic fail so the subscribe-ack path is testable.
+            if topic == "bad" {
+                return Err(RpcError::NotFound);
+            }
+            // Three synthetic updates derived from the topic, then end.
+            let items: Vec<SubUpdate> = (1..=3)
+                .map(|i| {
+                    SubUpdate::new(payload_from(&format!("{topic}#{i}")), Stamp::from_nanos(i))
+                })
+                .collect();
+            Ok(Box::pin(futures::stream::iter(items)) as BoxStream<'static, SubUpdate>)
+        })
+    }
+
+    fn write<'a>(
+        &'a mut self,
+        topic: &'a str,
+        payload: Payload,
+    ) -> BoxFut<'a, Result<(), RpcError>> {
+        let writes = self.writes.clone();
+        let topic = topic.to_string();
+        Box::pin(async move {
+            writes.lock().unwrap().push((topic, payload.to_vec()));
+            Ok(())
+        })
+    }
+}
+
+// ===========================================================================
+// Late-join snapshot dispatch (Layer 3) — a wildcard subscription whose
+// snapshot burst is larger than the client's per-subscription sink.
+// ===========================================================================
+
+/// Records covered by the wildcard subscription below. Deliberately larger than
+/// the client's private `SUBSCRIBE_CHANNEL_CAP` (256) so the late-join burst
+/// *must* overrun a consumer that hasn't started draining yet.
+const SNAPSHOT_RECORDS: usize = 300;
+
+/// The subscription's live event source, handed over once at `subscribe` so the
+/// test can push events *after* draining the snapshot burst.
+type EventFeed = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<SubUpdate>>>>;
+
+struct SnapshotDispatch {
+    feed: EventFeed,
+}
+
+impl Dispatch for SnapshotDispatch {
+    fn authenticate<'a>(
+        &'a self,
+        _peer: &'a PeerInfo,
+        _first: Option<&'a [u8]>,
+    ) -> BoxFut<'a, Result<SessionCtx, AuthError>> {
+        Box::pin(async { Ok(SessionCtx::default()) })
+    }
+
+    fn open(&self, _ctx: &SessionCtx) -> Box<dyn Session> {
+        Box::new(SnapshotSession {
+            feed: self.feed.clone(),
+        })
+    }
+}
+
+struct SnapshotSession {
+    feed: EventFeed,
+}
+
+impl Session for SnapshotSession {
+    fn call<'a>(
+        &'a mut self,
+        _method: &'a str,
+        params: Payload,
+    ) -> BoxFut<'a, Result<Payload, RpcError>> {
+        Box::pin(async move { Ok(params) })
+    }
+
+    fn snapshots(&mut self, _topic: &str) -> Vec<(String, Payload, Stamp)> {
+        (1..=SNAPSHOT_RECORDS)
+            .map(|i| {
+                (
+                    format!("rec.{i}"),
+                    payload_from(&format!("snap#{i}")),
+                    Stamp::from_nanos(i as u64),
+                )
+            })
+            .collect()
+    }
+
+    fn subscribe<'a>(
+        &'a mut self,
+        _topic: &'a str,
+    ) -> BoxFut<'a, Result<BoxStream<'static, SubUpdate>, RpcError>> {
+        let feed = self.feed.clone();
+        Box::pin(async move {
+            // One subscription per test run; a second would find the feed taken.
+            let rx = feed.lock().unwrap().take().ok_or(RpcError::Internal)?;
+            let stream =
+                futures::stream::unfold(
+                    rx,
+                    |mut rx| async move { rx.recv().await.map(|u| (u, rx)) },
+                );
+            Ok(Box::pin(stream) as BoxStream<'static, SubUpdate>)
+        })
+    }
+
+    fn write<'a>(
+        &'a mut self,
+        _topic: &'a str,
+        _payload: Payload,
+    ) -> BoxFut<'a, Result<(), RpcError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+// ===========================================================================
+// The exit-criterion test
+// ===========================================================================
+
+#[tokio::test]
+async fn echo_roundtrip_rpc_streaming_and_write() {
+    let (listener, dialer) = transport_pair();
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let dispatch = Arc::new(EchoDispatch {
+        writes: writes.clone(),
+    });
+
+    // Server engine on the runner's stand-in (a task — the engine itself is
+    // spawn-free; the test harness drives the one returned future).
+    let server = tokio::spawn(serve(
+        listener,
+        Arc::new(LineCodec),
+        dispatch,
+        SessionConfig::default(),
+    ));
+
+    // Client engine: handshake-as-caller (Ping/Pong), no reconnect for the test.
+    let ctx = aimdb_core::RuntimeContext::new(Arc::new(TestClock));
+    let (handle, client_fut) = run_client(
+        dialer,
+        LineCodec,
+        ClientConfig {
+            reconnect: false,
+            reconnect_delay: 10,
+            max_reconnect_delay: 10,
+            max_reconnect_attempts: 0,
+            keepalive_interval: None,
+            max_offline_queue: 1024,
+            sends_hello: true,
+        },
+        ctx,
+    );
+    let client = tokio::spawn(client_fut);
+
+    // 1) RPC: one request → one reply (echo).
+    let reply = handle.call("echo", payload_from("hello")).await.unwrap();
+    assert_eq!(&*reply, b"hello", "RPC reply should echo the params");
+
+    // 2) Streaming: subscribe → three events routed back by sub id.
+    let mut stream = handle.subscribe("temp").unwrap();
+    let e1 = stream.next().await.expect("event 1").expect("ok event 1");
+    let e2 = stream.next().await.expect("event 2").expect("ok event 2");
+    let e3 = stream.next().await.expect("event 3").expect("ok event 3");
+    assert_eq!(&*e1.data, b"temp#1");
+    assert_eq!(&*e2.data, b"temp#2");
+    assert_eq!(&*e3.data, b"temp#3");
+    // Each event carries the stamp of the write it reports, end to end.
+    assert_eq!([e1.ts, e3.ts], [Stamp::from_nanos(1), Stamp::from_nanos(3)]);
+
+    // 3) Fire-and-forget write, then a follow-up RPC. FIFO on the single
+    //    connection guarantees the write frame is processed before the reply
+    //    returns, so the write is observable by the time the call resolves.
+    handle.write("room", payload_from("on")).unwrap();
+    let _ = handle.call("noop", payload_from("x")).await.unwrap();
+    let got = writes.lock().unwrap().clone();
+    assert_eq!(
+        got,
+        vec![("room".to_string(), b"on".to_vec())],
+        "server should have received the write"
+    );
+
+    // Teardown: dropping the only handle stops the client engine gracefully;
+    // the server loop is unbounded, so abort it.
+    drop(handle);
+    drop(stream);
+    client
+        .await
+        .expect("client engine should stop cleanly when handles drop");
+    server.abort();
+}
+
+/// Subscribe-ack: a subscribe the server rejects must surface as a terminal
+/// `Err` item followed by end-of-stream — distinguishable from a disconnect (a
+/// plain `None`) so a caller can stop instead of re-subscribing forever, and
+/// never hanging (the original pre-fix behavior).
+#[tokio::test]
+async fn failed_subscribe_ends_stream_via_ack() {
+    let (listener, dialer) = transport_pair();
+    let dispatch = Arc::new(EchoDispatch {
+        writes: Arc::new(Mutex::new(Vec::new())),
+    });
+    let server = tokio::spawn(serve(
+        listener,
+        Arc::new(LineCodec),
+        dispatch,
+        SessionConfig::default(),
+    ));
+    let ctx = aimdb_core::RuntimeContext::new(Arc::new(TestClock));
+    let (handle, client_fut) = run_client(
+        dialer,
+        LineCodec,
+        ClientConfig {
+            reconnect: false,
+            reconnect_delay: 10,
+            max_reconnect_delay: 10,
+            max_reconnect_attempts: 0,
+            keepalive_interval: None,
+            max_offline_queue: 1024,
+            sends_hello: false,
+        },
+        ctx,
+    );
+    let client = tokio::spawn(client_fut);
+
+    // The "bad" topic is rejected server-side; the failure Reply must surface as
+    // a terminal `Err` item, then the stream ends. A generous timeout guards
+    // against the old hang-forever behavior.
+    let mut stream = handle.subscribe("bad").unwrap();
+    let rejected = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("failed subscribe must yield an item, not hang")
+        .expect("rejected subscribe should yield a terminal item");
+    assert_eq!(
+        rejected.unwrap_err(),
+        RpcError::NotFound,
+        "rejection should carry the server's error code"
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("stream must end after the rejection, not hang");
+    assert!(
+        ended.is_none(),
+        "stream should end after the terminal error"
+    );
+
+    drop(handle);
+    drop(stream);
+    let _ = client.await;
+    server.abort();
+}
+
+/// A late-join snapshot burst larger than the client's per-subscription sink
+/// must not vanish silently. Regression for the bug where the client demux
+/// discarded the snapshot `try_send` result *and* snapshots carried no `seq`: a
+/// wildcard subscription over 300 records delivered exactly
+/// `SUBSCRIBE_CHANNEL_CAP` (256) updates with no error and no gap, and because
+/// event `seq` then restarted at 1, no later event could reveal which initial
+/// states were lost — quietly breaking "one snapshot per matched record".
+///
+/// Sharing the `seq` space fixed that only once *some* later update arrived, so
+/// this test deliberately checks the whole accounting **before any event is
+/// injected**: a static subscription may never produce one, and a consumer must
+/// still be able to tell a complete initial state from a truncated one. The
+/// engine therefore reserves a sink slot for the burst's final snapshot, which
+/// arrives flagged `snapshot_end` and carrying the burst's whole loss count.
+#[tokio::test]
+async fn oversized_snapshot_burst_completes_without_a_live_event() {
+    let (listener, dialer) = transport_pair();
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<SubUpdate>();
+    let dispatch = Arc::new(SnapshotDispatch {
+        feed: Arc::new(Mutex::new(Some(event_rx))),
+    });
+    let server = tokio::spawn(serve(
+        listener,
+        Arc::new(LineCodec),
+        dispatch,
+        SessionConfig::default(),
+    ));
+    let ctx = aimdb_core::RuntimeContext::new(Arc::new(TestClock));
+    let (handle, client_fut) = run_client(
+        dialer,
+        LineCodec,
+        ClientConfig {
+            reconnect: false,
+            reconnect_delay: 10,
+            max_reconnect_delay: 10,
+            max_reconnect_attempts: 0,
+            keepalive_interval: None,
+            max_offline_queue: 1024,
+            sends_hello: false,
+        },
+        ctx,
+    );
+    let client = tokio::spawn(client_fut);
+
+    let mut stream = handle.subscribe("rec.#").unwrap();
+
+    // RPC barrier. The server serves frames in order and emits the whole burst
+    // inline while handling the Subscribe, so this reply is the *last* frame
+    // behind all 300 snapshots: once it resolves, the client demux has already
+    // pushed every snapshot at a sink nothing has drained yet — a deterministic
+    // overflow rather than a timing race.
+    let reply = handle.call("echo", payload_from("barrier")).await.unwrap();
+    assert_eq!(&*reply, b"barrier");
+
+    // Drain whatever actually landed in the sink.
+    let mut delivered = Vec::new();
+    while let Ok(next) = tokio::time::timeout(Duration::from_millis(50), stream.next()).await {
+        let item = next.expect("stream must stay open while the subscription lives");
+        delivered.push(item.expect("a snapshot burst must not be a terminal error"));
+    }
+
+    // Guard against a vacuous pass: raising SUBSCRIBE_CHANNEL_CAP past
+    // SNAPSHOT_RECORDS would make the burst fit and test nothing.
+    assert!(
+        delivered.len() < SNAPSHOT_RECORDS,
+        "burst must overrun the sink for this regression to mean anything; \
+         all {} snapshots fit — raise SNAPSHOT_RECORDS above SUBSCRIBE_CHANNEL_CAP",
+        delivered.len()
+    );
+
+    // --- everything below holds with NO event ever produced ----------------
+
+    // The burst terminates on an update the subscriber is guaranteed to see,
+    // and it is the *last* thing delivered — not buried mid-stream.
+    let (end_idx, end) = delivered
+        .iter()
+        .enumerate()
+        .find(|(_, u)| u.snapshot_end)
+        .expect(
+            "the burst must deliver its final snapshot even when it overran the sink — \
+             otherwise a static subscription can never tell truncated from complete",
+        );
+    assert_eq!(
+        end_idx,
+        delivered.len() - 1,
+        "the snapshot_end update must be the last one delivered"
+    );
+    assert_eq!(
+        delivered.iter().filter(|u| u.snapshot_end).count(),
+        1,
+        "exactly one update may close the burst"
+    );
+
+    // It is genuinely the burst's last record, so "initial state complete"
+    // means what it says.
+    assert_eq!(
+        end.topic.as_deref(),
+        Some(format!("rec.{SNAPSHOT_RECORDS}").as_str())
+    );
+    assert_eq!(&*end.data, format!("snap#{SNAPSHOT_RECORDS}").as_bytes());
+
+    // What landed before it is the contiguous head of the burst; all the loss
+    // is folded into the closing update.
+    for (i, update) in delivered[..end_idx].iter().enumerate() {
+        assert_eq!(
+            update.topic.as_deref(),
+            Some(format!("rec.{}", i + 1).as_str()),
+            "snapshot {i} should carry its concrete record topic, in burst order"
+        );
+        assert_eq!(&*update.data, format!("snap#{}", i + 1).as_bytes());
+        assert_eq!(
+            update.skipped, 0,
+            "the delivered head of the burst is contiguous"
+        );
+    }
+    assert!(
+        end.skipped > 0,
+        "this burst overran the sink, so the closing update must report the loss"
+    );
+
+    // The whole point, stated as a balance the consumer can compute itself,
+    // without waiting for anything further: every matched record is either
+    // delivered or accounted for as skipped.
+    let reported: u64 = delivered.iter().map(|u| u.skipped).sum();
+    assert_eq!(
+        delivered.len() as u64 + reported,
+        SNAPSHOT_RECORDS as u64,
+        "every matched record must be either delivered or reported lost"
+    );
+
+    // --- and the sequence is closed, so live events resume clean ------------
+    event_tx
+        .send(SubUpdate::new(payload_from("live"), Stamp::from_nanos(99)))
+        .expect("subscription stream should still be feeding");
+    let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("the live event must arrive")
+        .expect("stream must still be open")
+        .expect("a live event must not be a terminal error");
+
+    assert_eq!(&*event.data, b"live");
+    assert!(!event.snapshot_end, "a live event does not close a burst");
+    assert_eq!(
+        event.skipped, 0,
+        "the closing snapshot already accounted for the burst; the event adds no phantom gap"
+    );
+
+    drop(handle);
+    drop(stream);
+    let _ = client.await;
+    server.abort();
+}
+
+/// A subscription whose source stream *ends on its own* (the echo yields three
+/// updates, then completes) must free its slot against
+/// `max_subs_per_connection` once its pump drains. Regression for the bug where
+/// `run_session` pruned `cancels` only on an explicit Unsubscribe, so a
+/// naturally-ended subscription lingered in the map — leaking memory and, worse,
+/// permanently counting against the per-connection cap until a long-lived
+/// connection that churned subscriptions could open no more.
+#[tokio::test]
+async fn ended_subscription_frees_its_cap_slot() {
+    let (listener, dialer) = transport_pair();
+    let dispatch = Arc::new(EchoDispatch {
+        writes: Arc::new(Mutex::new(Vec::new())),
+    });
+    // Cap of 2: with the leak, the third subscribe is refused even though the
+    // first two have already ended.
+    let server = tokio::spawn(serve(
+        listener,
+        Arc::new(LineCodec),
+        dispatch,
+        SessionConfig {
+            limits: SessionLimits {
+                max_connections: 16,
+                max_subs_per_connection: 2,
+            },
+            reads_hello: false,
+            acks_subscribe: false,
+        },
+    ));
+    let ctx = aimdb_core::RuntimeContext::new(Arc::new(TestClock));
+    let (handle, client_fut) = run_client(
+        dialer,
+        LineCodec,
+        ClientConfig {
+            reconnect: false,
+            reconnect_delay: 10,
+            max_reconnect_delay: 10,
+            max_reconnect_attempts: 0,
+            keepalive_interval: None,
+            max_offline_queue: 1024,
+            sends_hello: false,
+        },
+        ctx,
+    );
+    let client = tokio::spawn(client_fut);
+
+    // Drain a subscription's three echo updates; the server-side stream then
+    // ends, so its pump finishes and is reaped.
+    async fn drain_three(
+        stream: &mut BoxStream<'static, Result<SubUpdate, RpcError>>,
+        topic: &str,
+    ) {
+        for i in 1..=3 {
+            let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("event should arrive")
+                .expect("an accepted subscription must yield its events")
+                .expect("an accepted subscription must not be rejected");
+            assert_eq!(&*ev.data, format!("{topic}#{i}").as_bytes());
+        }
+    }
+
+    // Open and fully consume two subscriptions (both fit under the cap of 2).
+    let mut a = handle.subscribe("a").unwrap();
+    drain_three(&mut a, "a").await;
+    let mut b = handle.subscribe("b").unwrap();
+    drain_three(&mut b, "b").await;
+
+    // Let the server forward the last events and reap both finished pumps.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A third subscribe must still be accepted — the two ended subs freed their
+    // slots. Pre-fix their `cancels` entries lingered, the cap stayed full, and
+    // this subscribe was refused (surfacing as an immediately-ended stream).
+    let mut c = handle.subscribe("c").unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), c.next())
+        .await
+        .expect("third subscribe must not hang");
+    assert_eq!(
+        first.map(|u| u.expect("third subscribe must be accepted").data.to_vec()),
+        Some(b"c#1".to_vec()),
+        "an ended subscription must free its cap slot; the third subscribe was refused"
+    );
+
+    drop(handle);
+    drop(a);
+    drop(b);
+    drop(c);
+    let _ = client.await;
+    server.abort();
+}
+
+// ===========================================================================
+// Abandoned calls (Layer 4) — a peer that keeps the link open but never replies
+// ===========================================================================
+
+/// Engine config for the silent-peer tests: one connection, no redial, no
+/// keepalive, so the only thing under test is the pending-call bookkeeping.
+fn silent_peer_config() -> ClientConfig {
+    ClientConfig {
+        reconnect: false,
+        keepalive_interval: None,
+        ..Default::default()
+    }
+}
+
+/// Read the next `REQ` frame the client engine put on the wire, as
+/// `(id, method, params)`.
+async fn read_request(peer: &mut Box<dyn Connection>) -> (u64, String, String) {
+    let frame = tokio::time::timeout(Duration::from_secs(2), peer.recv())
+        .await
+        .expect("the client must send its request")
+        .expect("the pipe must stay open")
+        .expect("the pipe must stay open");
+    let text = String::from_utf8(frame).expect("test frames are utf-8");
+    let mut parts = text.splitn(4, '\n');
+    assert_eq!(
+        parts.next(),
+        Some("REQ"),
+        "expected a request frame: {text}"
+    );
+    let id = parts
+        .next()
+        .and_then(|id| id.parse().ok())
+        .expect("request id");
+    let method = parts.next().expect("request method").to_string();
+    (id, method, parts.next().unwrap_or("").to_string())
+}
+
+/// Callers that time out and drop their `call` future must not accumulate in
+/// the engine's pending-call map.
+///
+/// A `Reply` or a disconnect used to be the only things that removed an entry,
+/// so a peer holding the connection open while never answering (the shape the
+/// WASM bridge's `query_timeout_ms` produces) cost one live `oneshot::Sender`
+/// per timed-out request for the life of the connection. Each abandoned call now
+/// cancels itself by id; the emptying of the table is asserted in the engine's
+/// own unit tests (`session::client::tests`), which can see it. This drives the
+/// same path end-to-end and pins the property the reclaim must not break —
+/// reply correlation still works afterwards.
+#[tokio::test]
+async fn repeated_call_timeouts_leave_the_connection_usable() {
+    let (mut listener, dialer) = transport_pair();
+    let ctx = aimdb_core::RuntimeContext::new(Arc::new(TestClock));
+    let (handle, client_fut) = run_client(dialer, LineCodec, silent_peer_config(), ctx);
+    let client = tokio::spawn(client_fut);
+    // The test *is* the peer: it reads every request and answers only the last.
+    let mut peer = listener.accept().await.expect("the client must dial");
+
+    for i in 0..64 {
+        let call = handle.call("hang", payload_from(&format!("{i}")));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), call)
+                .await
+                .is_err(),
+            "an unanswered call must not resolve"
+        );
+        let (_, method, _) = read_request(&mut peer).await;
+        assert_eq!(method, "hang", "each request must still reach the peer");
+    }
+
+    // The demux survived the reclaim sweeps: a call the peer *does* answer
+    // resolves with its own reply, so no live entry was pruned by mistake.
+    let answered = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.call("ping", payload_from("hi")).await }
+    });
+    let (id, method, params) = read_request(&mut peer).await;
+    assert_eq!((method.as_str(), params.as_str()), ("ping", "hi"));
+    peer.send(format!("REPLY\n{id}\nOK\npong").as_bytes())
+        .await
+        .expect("the pipe must stay open");
+    let reply = tokio::time::timeout(Duration::from_secs(2), answered)
+        .await
+        .expect("the answered call must resolve")
+        .expect("the call task must not panic")
+        .expect("the peer replied with OK");
+    assert_eq!(&*reply, b"pong");
+
+    drop(handle);
+    drop(peer);
+    let _ = client.await;
+}
+
+/// A call abandoned while its command still sits in the engine's queue is
+/// dropped instead of dialed out: nobody is left to receive the reply, so the
+/// request would only make the peer do work whose answer is discarded.
+#[tokio::test]
+async fn a_call_abandoned_before_dispatch_is_never_sent() {
+    let (mut listener, dialer) = transport_pair();
+    let ctx = aimdb_core::RuntimeContext::new(Arc::new(TestClock));
+    let (handle, client_fut) = run_client(dialer, LineCodec, silent_peer_config(), ctx);
+
+    // Zero deadline: `timeout` polls the call once — enough to enqueue the
+    // command — then gives up and drops it, all before the engine is driven.
+    assert!(
+        tokio::time::timeout(Duration::ZERO, handle.call("ghost", payload_from("x")))
+            .await
+            .is_err(),
+        "the call must be abandoned before the engine dequeues it"
+    );
+
+    let client = tokio::spawn(client_fut);
+    let mut peer = listener.accept().await.expect("the client must dial");
+
+    let answered = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.call("real", payload_from("hi")).await }
+    });
+    let (id, method, _) = read_request(&mut peer).await;
+    assert_eq!(
+        method, "real",
+        "an abandoned call must not be sent to the peer"
+    );
+    peer.send(format!("REPLY\n{id}\nOK\npong").as_bytes())
+        .await
+        .expect("the pipe must stay open");
+    let reply = tokio::time::timeout(Duration::from_secs(2), answered)
+        .await
+        .expect("the answered call must resolve")
+        .expect("the call task must not panic")
+        .expect("the peer replied with OK");
+    assert_eq!(&*reply, b"pong");
+
+    drop(handle);
+    drop(peer);
+    let _ = client.await;
+}
+
+/// The concurrent shape of the same regression: every call is in flight (so
+/// none is reclaimable) and the whole batch then times out at once, with no
+/// later call and no keepalive to drive a sweep. Each abandoned call carries its
+/// own cancellation, so the engine frees all of them and stays usable.
+#[tokio::test]
+async fn a_concurrent_batch_of_timeouts_leaves_the_connection_usable() {
+    const BATCH: usize = 256;
+    let (mut listener, dialer) = transport_pair();
+    let ctx = aimdb_core::RuntimeContext::new(Arc::new(TestClock));
+    let (handle, client_fut) = run_client(dialer, LineCodec, silent_peer_config(), ctx);
+    let client = tokio::spawn(client_fut);
+    let mut peer = listener.accept().await.expect("the client must dial");
+
+    let batch: Vec<_> = (0..BATCH)
+        .map(|i| {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_millis(50),
+                    handle.call("hang", payload_from(&format!("{i}"))),
+                )
+                .await
+            })
+        })
+        .collect();
+
+    // Every request reaches the peer while its caller is still waiting.
+    for _ in 0..BATCH {
+        let (_, method, _) = read_request(&mut peer).await;
+        assert_eq!(method, "hang", "each request must reach the peer");
+    }
+    for task in batch {
+        assert!(
+            task.await.expect("the call task must not panic").is_err(),
+            "an unanswered call must not resolve"
+        );
+    }
+
+    // Correlation is intact after the batch was reclaimed.
+    let answered = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.call("ping", payload_from("hi")).await }
+    });
+    let (id, method, params) = read_request(&mut peer).await;
+    assert_eq!((method.as_str(), params.as_str()), ("ping", "hi"));
+    peer.send(format!("REPLY\n{id}\nOK\npong").as_bytes())
+        .await
+        .expect("the pipe must stay open");
+    let reply = tokio::time::timeout(Duration::from_secs(2), answered)
+        .await
+        .expect("the answered call must resolve")
+        .expect("the call task must not panic")
+        .expect("the peer replied with OK");
+    assert_eq!(&*reply, b"pong");
+
+    drop(handle);
+    drop(peer);
+    let _ = client.await;
+}
+
+// ===========================================================================
+// One-shot transports — the moved-in dual of the re-dialable/re-bindable pair.
+//
+// Ported here from `aimdb-embassy-adapter`'s connector smoke test when the
+// Embassy-specific spine was retired: the types are runtime-neutral now, and
+// `serve` has no other test of its own.
+// ===========================================================================
+
+/// A moved-in stream has nothing to redial, so the second attempt must be an
+/// error — and specifically `Closed`, which `run_client` treats as terminal
+/// rather than backing off into a permanently-failing redial loop.
+#[tokio::test]
+async fn a_one_shot_dialer_hands_out_one_connection_then_reports_closed() {
+    let (a, _b) = conn_pair();
+    let dialer = OneShotDialer::new(a);
+
+    assert!(dialer.connect().await.is_ok(), "first connect hands it out");
+    assert_eq!(
+        dialer.connect().await.err(),
+        Some(TransportError::Closed),
+        "`Closed` is what stops the engine; `Io` would earn a backoff and retry"
+    );
+}
+
+/// The listener dual: `serve` loops on `accept`, so a point-to-point link with
+/// no second peer must park rather than error — an erroring accept would tear
+/// the server down.
+#[tokio::test]
+async fn a_one_shot_listener_parks_after_its_only_accept() {
+    let (a, _b) = conn_pair();
+    let mut listener = OneShotListener::new(a);
+
+    assert!(listener.accept().await.is_ok(), "first accept yields");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "the second accept must park, not resolve"
+    );
+}
+
+/// End to end: `serve` handles the one peer the listener has, and when that
+/// peer hangs up it goes back to waiting on the parked accept instead of
+/// returning — the exact shape a UART server runs in.
+#[tokio::test]
+async fn serve_over_a_one_shot_listener_handles_the_peer_then_keeps_waiting() {
+    let writes: WriteLog = Arc::new(Mutex::new(Vec::new()));
+    let dispatch = Arc::new(EchoDispatch {
+        writes: writes.clone(),
+    });
+
+    let (server_end, mut client_end) = conn_pair();
+    let server = tokio::spawn(serve(
+        OneShotListener::new(server_end),
+        Arc::new(LineCodec),
+        dispatch,
+        SessionConfig::default(),
+    ));
+
+    // One fire-and-forget write, then hang up.
+    client_end
+        .send(
+            b"WRITE
+topic
+hello",
+        )
+        .await
+        .expect("send the write");
+    drop(client_end);
+
+    // The session ran: the write reached the dispatch.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if !writes.lock().unwrap().is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the write never reached the dispatch"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    // ...and `serve` is still running, parked on the second accept.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), server)
+            .await
+            .is_err(),
+        "serve must keep waiting on the parked accept, not return"
+    );
+}
+
+// ===========================================================================
+// Subscription ids (#328) — a raw peer against `serve`, so the test decides
+// exactly which ids go on the wire.
+// ===========================================================================
+
+/// Every subscription follows one live feed until it is cancelled.
+struct FeedDispatch {
+    feed: tokio::sync::broadcast::Sender<SubUpdate>,
+}
+
+impl Dispatch for FeedDispatch {
+    fn authenticate<'a>(
+        &'a self,
+        _peer: &'a PeerInfo,
+        _first: Option<&'a [u8]>,
+    ) -> BoxFut<'a, Result<SessionCtx, AuthError>> {
+        Box::pin(async { Ok(SessionCtx::default()) })
+    }
+
+    fn open(&self, _ctx: &SessionCtx) -> Box<dyn Session> {
+        Box::new(FeedSession {
+            feed: self.feed.clone(),
+        })
+    }
+}
+
+struct FeedSession {
+    feed: tokio::sync::broadcast::Sender<SubUpdate>,
+}
+
+impl Session for FeedSession {
+    fn starts_session(&self, method: &str) -> bool {
+        method == "hello"
+    }
+
+    fn call<'a>(
+        &'a mut self,
+        _method: &'a str,
+        params: Payload,
+    ) -> BoxFut<'a, Result<Payload, RpcError>> {
+        Box::pin(async move { Ok(params) })
+    }
+
+    fn subscribe<'a>(
+        &'a mut self,
+        _topic: &'a str,
+    ) -> BoxFut<'a, Result<BoxStream<'static, SubUpdate>, RpcError>> {
+        let rx = self.feed.subscribe();
+        Box::pin(async move {
+            let stream = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.ok().map(|u| (u, rx))
+            });
+            Ok(Box::pin(stream) as BoxStream<'static, SubUpdate>)
+        })
+    }
+
+    fn write<'a>(
+        &'a mut self,
+        _topic: &'a str,
+        _payload: Payload,
+    ) -> BoxFut<'a, Result<(), RpcError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A `serve` over [`FeedDispatch`] and a raw connection to it. The dialer is
+/// returned so it stays alive: dropping it closes the listener.
+async fn feed_session() -> (
+    Box<dyn Connection>,
+    tokio::sync::broadcast::Sender<SubUpdate>,
+    tokio::task::JoinHandle<()>,
+    ChannelDialer,
+) {
+    let (listener, dialer) = transport_pair();
+    let (feed, _) = tokio::sync::broadcast::channel(16);
+    let server = tokio::spawn(serve(
+        listener,
+        Arc::new(LineCodec),
+        Arc::new(FeedDispatch { feed: feed.clone() }),
+        SessionConfig {
+            limits: SessionLimits {
+                max_connections: 1,
+                max_subs_per_connection: 8,
+            },
+            reads_hello: false,
+            acks_subscribe: false,
+        },
+    ));
+    let conn = dialer.connect().await.expect("connect");
+    (conn, feed, server, dialer)
+}
+
+/// Every frame the server sends within `window`, as text.
+async fn frames_within(conn: &mut Box<dyn Connection>, window: Duration) -> Vec<String> {
+    let mut frames = Vec::new();
+    let deadline = tokio::time::Instant::now() + window;
+    while let Ok(Ok(Some(frame))) = tokio::time::timeout_at(deadline, conn.recv()).await {
+        frames.push(String::from_utf8(frame).expect("utf-8 frame"));
+    }
+    frames
+}
+
+/// Publishes `value` once the server's subscriptions are registered, and
+/// returns what arrived for it.
+async fn publish(
+    conn: &mut Box<dyn Connection>,
+    feed: &tokio::sync::broadcast::Sender<SubUpdate>,
+    value: &str,
+) -> Vec<String> {
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = feed.send(SubUpdate::new(payload_from(value), Stamp::from_nanos(0)));
+    frames_within(conn, Duration::from_millis(200)).await
+}
+
+/// A subscribe whose id names a live subscription is refused; the live one
+/// keeps delivering, once per update. Before, the new entry replaced the live
+/// one, which cancelled it, and the cleanup of the cancelled pump then removed
+/// the new entry too: the id went silent.
+#[tokio::test]
+async fn a_subscribe_reusing_a_live_id_is_refused() {
+    let (mut conn, feed, server, _dialer) = feed_session().await;
+
+    conn.send(b"SUB\n2\nfeed").await.unwrap();
+    let first = publish(&mut conn, &feed, "v1").await;
+    assert_eq!(first, ["EVENT\n2\n1\n0\n-\nv1"]);
+
+    conn.send(b"SUB\n2\nfeed").await.unwrap();
+    let refused = frames_within(&mut conn, Duration::from_millis(200)).await;
+    assert_eq!(refused, ["REPLY\n2\nERR\ndenied"]);
+
+    let after = publish(&mut conn, &feed, "v2").await;
+    assert_eq!(
+        after,
+        ["EVENT\n2\n2\n0\n-\nv2"],
+        "the live subscription keeps delivering"
+    );
+    server.abort();
+}
+
+/// An id reused after an Unsubscribe belongs to the new subscription: the old
+/// pump, ending late, must not remove the new entry.
+#[tokio::test]
+async fn an_id_reused_after_unsubscribe_keeps_delivering() {
+    let (mut conn, feed, server, _dialer) = feed_session().await;
+
+    conn.send(b"SUB\n2\nfeed").await.unwrap();
+    assert_eq!(
+        publish(&mut conn, &feed, "v1").await,
+        ["EVENT\n2\n1\n0\n-\nv1"]
+    );
+
+    // Back to back: the old pump is cancelled but not yet reaped when the new
+    // subscription registers under the same id.
+    conn.send(b"UNSUB\n2").await.unwrap();
+    conn.send(b"SUB\n2\nfeed").await.unwrap();
+
+    for (n, value) in ["v2", "v3"].into_iter().enumerate() {
+        let got = publish(&mut conn, &feed, value).await;
+        assert_eq!(
+            got,
+            [format!("EVENT\n2\n{}\n0\n-\n{value}", n + 1)],
+            "the reused id must keep delivering"
+        );
+    }
+    server.abort();
+}
+
+/// A second handshake on a connection that never closed (a serial line) is a
+/// new client: the old client's subscriptions end and release their source,
+/// and the new client's subscription under the same id delivers once per
+/// update. Before, the old subscriptions lived on, kept their sources, and the
+/// new subscribe collided with them.
+#[tokio::test]
+async fn a_second_handshake_starts_a_new_session() {
+    let (mut conn, feed, server, _dialer) = feed_session().await;
+
+    // Client A: handshake, two subscriptions.
+    conn.send(b"REQ\n1\nhello\nA").await.unwrap();
+    conn.send(b"SUB\n2\nfeed").await.unwrap();
+    conn.send(b"SUB\n3\nfeed").await.unwrap();
+    let a = publish(&mut conn, &feed, "v1").await;
+    assert_eq!(a.len(), 3, "A's reply and two events: {a:?}");
+    assert_eq!(feed.receiver_count(), 2);
+
+    // Client B on the same connection: its handshake ends A's session.
+    conn.send(b"REQ\n1\nhello\nB").await.unwrap();
+    let reply = frames_within(&mut conn, Duration::from_millis(200)).await;
+    assert_eq!(reply, ["REPLY\n1\nOK\nB"]);
+    assert_eq!(
+        feed.receiver_count(),
+        0,
+        "A's subscriptions released their source"
+    );
+
+    // No event of A's subscriptions reaches B.
+    let quiet = publish(&mut conn, &feed, "v2").await;
+    assert!(
+        quiet.is_empty(),
+        "nothing for B before it subscribes: {quiet:?}"
+    );
+
+    // B subscribes under A's id: delivered once per update.
+    conn.send(b"SUB\n2\nfeed").await.unwrap();
+    let b = publish(&mut conn, &feed, "v3").await;
+    assert_eq!(b, ["EVENT\n2\n1\n0\n-\nv3"]);
+    assert_eq!(feed.receiver_count(), 1);
+    server.abort();
+}
+
+/// The first handshake on a connection changes nothing: subscriptions opened
+/// before it stay.
+#[tokio::test]
+async fn the_first_handshake_keeps_earlier_subscriptions() {
+    let (mut conn, feed, server, _dialer) = feed_session().await;
+
+    conn.send(b"SUB\n2\nfeed").await.unwrap();
+    conn.send(b"REQ\n1\nhello\nA").await.unwrap();
+    let got = publish(&mut conn, &feed, "v1").await;
+    assert_eq!(got, ["REPLY\n1\nOK\nA", "EVENT\n2\n1\n0\n-\nv1"]);
+    server.abort();
+}
+
+/// A subscription whose source ends on its own (here after three updates; on
+/// a device, a buffer that had no subscriber slot left) is reported: the
+/// client gets its events, then a terminal `Internal` error, then the end.
+/// Before, the stream just stopped, so an acknowledged subscription that
+/// never delivered looked like a quiet record.
+#[tokio::test]
+async fn a_subscription_that_ends_on_its_own_is_reported() {
+    let (listener, dialer) = transport_pair();
+    let server = tokio::spawn(serve(
+        listener,
+        Arc::new(LineCodec),
+        Arc::new(EchoDispatch {
+            writes: Arc::new(Mutex::new(Vec::new())),
+        }),
+        SessionConfig::default(),
+    ));
+    let ctx = aimdb_core::RuntimeContext::new(Arc::new(TestClock));
+    let (handle, client_fut) = run_client(
+        dialer,
+        LineCodec,
+        ClientConfig {
+            reconnect: false,
+            reconnect_delay: 10,
+            max_reconnect_delay: 10,
+            max_reconnect_attempts: 0,
+            keepalive_interval: None,
+            max_offline_queue: 1024,
+            sends_hello: false,
+        },
+        ctx,
+    );
+    let client = tokio::spawn(client_fut);
+
+    let mut stream = handle.subscribe("temp").unwrap();
+    let mut items = Vec::new();
+    while let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
+        items.push(item.map(|u| String::from_utf8(u.data.to_vec()).unwrap()));
+    }
+    assert_eq!(
+        items,
+        [
+            Ok("temp#1".to_string()),
+            Ok("temp#2".to_string()),
+            Ok("temp#3".to_string()),
+            Err(RpcError::Internal),
+        ]
+    );
+
+    drop(stream);
+    drop(handle);
+    let _ = client.await;
+    server.abort();
+}
+
+/// Only a subscription the client still holds is reported when it ends: an
+/// unsubscribed one, and the previous client's after a new handshake, end in
+/// silence.
+#[tokio::test]
+async fn an_ended_subscription_the_client_dropped_is_not_reported() {
+    let (mut conn, feed, server, _dialer) = feed_session().await;
+
+    conn.send(b"SUB\n2\nfeed").await.unwrap();
+    conn.send(b"UNSUB\n2").await.unwrap();
+    conn.send(b"REQ\n1\nhello\nA").await.unwrap();
+    conn.send(b"SUB\n3\nfeed").await.unwrap();
+    conn.send(b"REQ\n4\nhello\nB").await.unwrap();
+    let frames = publish(&mut conn, &feed, "v1").await;
+    assert_eq!(frames, ["REPLY\n1\nOK\nA", "REPLY\n4\nOK\nB"]);
+    server.abort();
+}
+
+// ===========================================================================
+// Accept errors (#351) — a listener that hands out one connection, then fails
+// every further accept.
+// ===========================================================================
+
+/// Hands out `first`, then answers every accept with `error`, at once.
+struct ScriptedListener {
+    first: Option<Box<dyn Connection>>,
+    error: TransportError,
+}
+
+impl Listener for ScriptedListener {
+    fn accept(&mut self) -> BoxFut<'_, TransportResult<Box<dyn Connection>>> {
+        Box::pin(async move {
+            match self.first.take() {
+                Some(conn) => Ok(conn),
+                None => Err(self.error.clone()),
+            }
+        })
+    }
+}
+
+/// `serve` over a [`ScriptedListener`] failing with `error`, and the peer of
+/// its one connection.
+fn scripted_serve(error: TransportError) -> (Box<dyn Connection>, tokio::task::JoinHandle<()>) {
+    let (server_side, client) = conn_pair();
+    let (feed, _) = tokio::sync::broadcast::channel(16);
+    let server = tokio::spawn(serve(
+        ScriptedListener {
+            first: Some(Box::new(server_side)),
+            error,
+        },
+        Arc::new(LineCodec),
+        Arc::new(FeedDispatch { feed }),
+        SessionConfig::default(),
+    ));
+    (Box::new(client), server)
+}
+
+/// A listener that reports `Closed` hands out no more connections; `serve`
+/// keeps serving the open one. Before, it called `accept` again at once,
+/// forever, and the open connection never got a turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_listener_still_serves_its_open_connections() {
+    let (mut conn, server) = scripted_serve(TransportError::Closed);
+
+    conn.send(b"PING").await.unwrap();
+    let frames = frames_within(&mut conn, Duration::from_secs(1)).await;
+    assert_eq!(frames, ["PONG"]);
+    server.abort();
+}
+
+/// Once the listener is closed and its last connection ends, `serve` returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_returns_once_a_closed_listeners_connections_end() {
+    let (conn, server) = scripted_serve(TransportError::Closed);
+
+    drop(conn);
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .expect("serve returns after its last connection ends")
+        .expect("serve does not panic");
+}
+
+/// A listener whose accept fails at once, every time, no longer starves the
+/// open connections: the accept after an error yields first. Before, `serve`
+/// retried millions of times a second and never polled them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accept_that_keeps_failing_does_not_starve_open_connections() {
+    let (mut conn, server) = scripted_serve(TransportError::Io);
+
+    conn.send(b"PING").await.unwrap();
+    let frames = frames_within(&mut conn, Duration::from_secs(1)).await;
+    assert_eq!(frames, ["PONG"]);
+    server.abort();
+}
+
+/// ... and `serve` stays cancellable: it returns to the executor between
+/// accepts, so `abort` takes effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_over_a_failing_listener_can_be_aborted() {
+    let (_conn, server) = scripted_serve(TransportError::Io);
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    server.abort();
+    let joined = tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .expect("an aborted serve ends");
+    assert!(joined.unwrap_err().is_cancelled());
+}

@@ -1,0 +1,209 @@
+# Changelog
+
+All notable changes to `aimdb-wasm-adapter` will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Changed (breaking, wire)
+
+- **`query()` resolves with `{ records }` (#429).** `total` is gone; use
+  `records.length`.
+
+## [0.4.0] - 2026-11-03
+
+### Changed (breaking)
+
+- **Write timestamps and AimX 4.0 (#326).** Buffers hold `Stamped<T>`;
+  `new_clock()` replaces `now_nanos`/`unix_time`. The bridge speaks AimX 4.0
+  (`?v=4.0`). `WasmDb.get` and `subscribe` callbacks yield `{ value, ts }`
+  instead of the bare value; `ts` is a `BigInt` of nanoseconds.
+
+## [0.3.0] - 2026-09-18
+
+### Added
+
+- **A schema-name collision trips a `debug_assert!`.** `SchemaRegistry` keys on
+  `T::NAME` with no version component, so a v1 and v2 of one contract silently
+  kept whichever came last — visible only as a browser rendering nothing.
+  Re-registering the same type stays idempotent.
+
+### Removed
+
+- **`src/react/useAimDb.tsx` deleted** (~313 lines). It was never in the
+  published artifact — `wasm-pack` packs only `pkg/` — and could not have been
+  imported if it were: it resolved `../pkg/aimdb_wasm_adapter`, a relative path
+  into the adapter's own build output. The README advertised it as
+  `@aimdb/wasm/react`, a package that does not exist. The patterns worth keeping
+  (StrictMode `cancelled` guard, refs for the cleanup closure,
+  `bridge.disconnect()` before `db.free()`, not-ready fallback) are documented
+  in the README and implemented in `weather-mesh-client`.
+
+### Changed
+
+- **A host build with `wasm-runtime` on fails with one `compile_error!`** naming
+  the constraint, instead of 14 `E0277`s from inside the bridge. `bindings`,
+  `schema_registry`, and `ws_bridge` are now also gated on
+  `target_arch = "wasm32"`. `--no-default-features` host builds and all `wasm32`
+  builds are unaffected.
+
+### Documentation
+
+- **`SchemaRegistry` documents the migration boundary.** Inbound payloads decode
+  straight into `T`, not through `Linkable::from_bytes`, so `Migratable` chains
+  do not run in the browser — intended, since AimX is a normalized plane and
+  migration belongs at a server's ingest boundary. A browser's version tolerance
+  therefore comes from the server it mirrors.
+- **README corrected**: package name in every example (`@aimdb/wasm` →
+  `@aimdb/aimdb-wasm-adapter`), the module table (listed a nonexistent
+  `logger.rs`, credited `time.rs` to `gloo-timers` which is not a dependency),
+  and the contract-enforcement section (described a `dispatch_streamable!` macro
+  that no longer exists). Adds target-support and published-package notes.
+
+### Changed (breaking) — Design 047: `WsBridge` is an AimX engine client
+
+- **`WsBridge` rewritten on `run_client` + `ClientHandle`** over a
+  `web_sys::WebSocket`-backed `Connection`/`Dialer`: reply/subscription
+  correlation, reconnect backoff, keepalive, and the offline queue now live in
+  `aimdb-core`'s client engine — the hand-rolled 835-line demux is gone. The
+  `#[wasm_bindgen]` *method* surface is preserved (`write`, `query`,
+  `listTopics`, `onStatusChange`, `status`, `disconnect`, `connectBridge`
+  options) — with the one `connectBridge` behavior change noted below — but the
+  wire is AimX, so the bridge only talks to design-047 servers.
+  `BridgeOptions.lateJoin` is retained for option-shape compatibility
+  (snapshots are server-driven under AimX).
+- **`connectBridge` no longer throws on a URL the browser rejects.** The socket
+  is the dialer's to build now, so construction succeeds and the failure arrives
+  as a terminal `"disconnected"` status (logged to the console, engine stopped —
+  it does not retry a URL no redial can fix). A caller that wrapped
+  `connectBridge` in `try`/`catch` to detect a bad URL must observe
+  `onStatusChange` instead, where a rejected URL is no longer distinguishable
+  from an unreachable server.
+- **`BridgeOptions.maxOfflineQueue` keeps its name but not its contract.** It is
+  now the capacity of the shared client engine's *command channel*, so RPC calls
+  share the bound with writes and subscribes: an evicted `query`/`listTopics`
+  rejects its promise, an evicted `subscribe` ends its stream. It still only
+  fills while the engine isn't draining it (a pending dial, the reconnect
+  backoff), and eviction is still oldest-first. The value is now clamped to
+  `1..=8192` — the ring is preallocated, so `0` could never deliver anything and
+  is raised to `1`, and larger values are capped rather than honored.
+- **`WasmDb.discover` / the raw discovery path speak `record.list`** and
+  resolve with core's full `RecordMetadata` rows (was the topic-scoped
+  `{name, schema_type, entity}` shape). The topic is `record_key` — `name` is
+  the Rust type name — so `discover(…)` results feed `configureRecord` as
+  `configureRecord(row.record_key, { schemaType: row.schema_type, … })`.
+- **The bridge and discovery declare their AimX version** on the WebSocket
+  upgrade URL (`?v=3.0`, via `aimdb_core::remote::ws_url_with_version`), which a
+  design-047 server gates on (HTTP 426 on mismatch) — a browser cannot set
+  handshake headers, so the version rides the URL.
+- Depends on `aimdb-core`'s `connector-session` + `remote` features (the
+  engines cross-compile to wasm32); the `aimdb-ws-protocol` dependency is
+  gone.
+
+### Fixed
+
+- **`WsBridge` no longer reports a zombie `"connected"` after a silent
+  teardown (Design 049 D1).** Dropping a connection without an `onclose` — a
+  frame-funnel overflow ending the stream, an engine stop — left
+  `onStatusChange` / `status()` reporting `"connected"` forever with
+  `autoReconnect: false`, because `Drop` detaches `onclose` before closing the
+  socket. The teardown now reports the transition itself (`"disconnected"`, or
+  `"reconnecting"` when auto-reconnect will redial), deduplicated so the paths
+  that already reported stay idempotent.
+- **`disconnect()` interrupts a pending handshake (Design 049 D2).** The dialer
+  publishes its socket before awaiting `onopen`, so `disconnect()` during a
+  dial closes the in-flight socket instead of leaving it to the browser's
+  connect timeout (tens of seconds) — and the interrupted dial reports a
+  *terminal* failure, stopping the engine on that attempt rather than after a
+  further reconnect backoff.
+- **SingleLatest fresh-subscriber parity (Design 040).** A subscriber created
+  *after* a value has been published now receives that current value on its
+  first `recv()` / `try_recv()`, instead of waiting for the next push. This
+  matches the tokio and embassy adapters and is the documented cross-runtime
+  contract — a dashboard that subscribes to a config record after the producer
+  published now renders the current state on mount rather than blank until the
+  next change. `WasmBuffer::subscribe()` initializes the reader as
+  never-having-seen-anything (`last_seen_version: 0`) rather than snapshotting
+  the current version.
+- **`peek()` on WASM buffers (Design 040).** `WasmBuffer` now overrides
+  `DynBuffer::peek()`, returning the current value for `SingleLatest` and the
+  pending slot for `Mailbox` (`None` for `SpmcRing`), matching tokio/embassy.
+  The buffer-native non-destructive read used by AimX `record.get` previously
+  returned `None` on WASM.
+
+### Changed (behavioral)
+
+- **`WsBridge`'s inbound frame funnel is bounded and overflow ends the
+  connection.** The queue between the browser `onmessage` callback and the
+  engine's `recv` was unbounded; it is now capped at 1024 frames, 1 MiB per
+  frame, and 8 MiB total. Past any limit the stream ends without draining the
+  backlog — dropping frames instead would lose data of unknown shape — so the
+  engine reads a disconnect, pending `query`/`listTopics` promises reject
+  rather than hang, and the redial + re-subscribe re-syncs from scratch.
+  Visible from JS as a `reconnecting` status flap plus a console warning.
+- **JS/WASM `SingleLatest` subscribers may observe one extra initial delivery.**
+  As a consequence of the fresh-subscriber fix above, `subscribe` /
+  `subscribe_typed` (bindings and `WsBridge`) now fire an immediate callback with
+  the current value when one already exists. Portable code already tolerates
+  this (the other two runtimes behave this way); only code that treated every
+  delivery as a *transition* is affected.
+
+### Added
+
+- **`WsBridge` surfaces subscription delivery gaps: `onGap(topic, skipped)` +
+  `droppedUpdates()`.** The pump reads the engine's per-update `skipped` count
+  and reports it (console warning always; the registered handler in addition),
+  instead of routing the payload and discarding the gap. A mirror that jumped
+  ahead because the server-side buffer overran a slow consumer is no longer
+  indistinguishable from an idle producer.
+
+- **Host-run buffer unit tests + shared contract suite (Design 040).** `buffer.rs`
+  now has native (`cargo test`) unit tests for the fresh-subscriber and `peek()`
+  semantics, plus the `aimdb-core` `buffer::test_support` conformance suite run
+  under `futures::executor::block_on` — the same suite the tokio and embassy
+  adapters run. Added `futures` as a host-only (wasm32-excluded) dev-dependency.
+
+### Changed (breaking)
+
+- **Issue #131 — `WasmRecordRegistrarExt` shrinks to `.buffer(cfg)` only** (`source`/`tap`/`transform` are inherent on the non-generic `RecordRegistrar<'a, T>`); `join_queue.rs` (`WasmJoinQueue`) is deleted with the `JoinFanInRuntime` family; bindings/bridge take the non-generic `AimDb`.
+
+### Added
+
+- **`RuntimeOps` implemented for `WasmAdapter` (Issue #130, design 034 Phase 2).** The dyn-safe capability surface from `aimdb-executor`: `now_nanos()` from `Performance.now()` (monotonic ms since page load), `unix_time()` from `Date.now()` (wall clock — the generic `TimeOps::unix_time` default still returns `None`), `sleep` boxes the setTimeout-Promise future, `log` forwards to the console-backed `Logger`. Browser contract test via `wasm_bindgen_test`; native fallback covered by a sync-surface test.
+
+### Changed
+
+- **`record.set` write path routes through `Producer<T>` (M15, Design 031).** `bindings.rs` (`set`) and `ws_bridge.rs` now call `db.producer::<T>(key)?.produce(val)` instead of the removed `TypedRecord::produce`. Internal only — no `#[wasm_bindgen]` / JS API change.
+
+### Removed (breaking)
+
+- **`impl Spawn for WasmAdapter` deleted (Issue #88).** Also removed the `unsafe impl Send/Sync for WasmAdapter` — the adapter is a ZST and auto-derives both.
+- `bindings.rs::Database::build()` now consumes the `AimDbRunner` returned from `AimDbBuilder::build()` and drives it via `wasm_bindgen_futures::spawn_local`, so existing JS callers keep working with no API change.
+
+## [0.2.0] - 2026-05-22
+
+### Added
+
+- **`TimeOps::duration_as_nanos` implementation**: Converts `WasmDuration` (milliseconds as `f64`) to nanoseconds, clamped to `[0, u64::MAX]`. Required by the new `aimdb-executor` trait method (used by stage profiling, Issue #58).
+- **`WasmJoinQueue` (Design 027)**: WASM implementation of the `JoinFanInRuntime` traits from `aimdb-executor`, backed by `futures_channel::mpsc::channel` with internal capacity 64. Enables `transform_join` on the WASM runtime.
+- **`transform_join` integration test** (`tests/transform_join_integration_tests.rs`, `wasm-bindgen-test`): two-input sum scenario verifying outputs are produced once both inputs have been seen.
+
+### Changed
+
+- **Dependencies**: added `futures-channel` (with `std` + `sink` features — `mpsc` requires `std` because its internal `BiLock` uses `std::sync`); enabled `sink` on `futures-util`.
+
+## [0.1.1] - 2026-03-16
+
+### Added
+
+- Initial release of the AimDB WebAssembly runtime adapter
+- Full `aimdb-executor` trait implementations: `RuntimeAdapter`, `Spawn`, `TimeOps`, `Logger`
+- `Rc<RefCell<…>>` buffer implementation — zero-overhead for single-threaded WASM
+- All three buffer types: SPMC Ring, SingleLatest, Mailbox
+- `WasmDb` facade via `#[wasm_bindgen]`: `configureRecord`, `get`, `set`, `subscribe`
+- `WsBridge` — WebSocket bridge connecting browser to remote AimDB server
+- `SchemaRegistry` for type-erased record dispatch with extensible `.register::<T>()` API
+- React hooks: `useRecord<T>`, `useSetRecord<T>`, `useBridge`
+- `no_std` + `alloc` compatible (`wasm32-unknown-unknown` target)

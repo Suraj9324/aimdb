@@ -1,0 +1,73 @@
+[package]
+name = "aimdb-sync"
+version = "0.7.0"
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Synchronous blocking wrapper for AimDB - bridge async database to sync code"
+repository.workspace = true
+keywords = ["sync", "blocking", "wrapper", "database", "api"]
+categories = ["database", "api-bindings"]
+
+[dependencies]
+# Core dependencies
+# `default-features = false` is load-bearing: aimdb-core's default set is
+# ["std", "alloc", "derive"], so inheriting it would pull anyhow/serde/remote
+# into the `--no-default-features` build and silently un-no_std this crate.
+# The `std` feature below forwards to `aimdb-core/std` for the std path.
+aimdb-core = { path = "../aimdb-core", version = "3.0.0", default-features = false, features = [
+    "alloc",
+] }
+aimdb-tokio-adapter = { path = "../aimdb-tokio-adapter", version = "0.8.0", optional = true }
+
+# Tokio for channels and runtime
+tokio = { version = "1.40", features = ["sync", "rt", "time", "macros"], optional = true }
+
+# Error handling
+thiserror = { version = "2.0.16", default-features = false }
+
+# Optional: Settable::set (feature `data-contracts`) for the `set_value` family.
+# aimdb-sync depends on the contracts crate, never the reverse — the contracts
+# crate has no `sync` feature.
+aimdb-data-contracts = { path = "../aimdb-data-contracts", version = "0.3.0", optional = true, default-features = false, features = [
+    "settable",
+] }
+
+# For type erasure and Any
+[dev-dependencies]
+# Testing dependencies
+tokio = { version = "1.40", features = ["full", "test-util"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[features]
+default = ["std"]
+
+std = ["aimdb-core/std", "dep:tokio", "dep:aimdb-tokio-adapter", "dep:libc"]
+
+# The facade's two destinations. Required, not cosmetic: the `log_*` macros
+# expand in this crate, so each arm is selected by *this* crate's features and
+# `aimdb-core/{tracing,log}` alone would leave these call sites unrouted.
+# Neither dependency is declared here — since design 050 §10.4 both arms reach
+# their crate through `aimdb_core::__private`.
+tracing = ["aimdb-core/tracing"]
+log = ["aimdb-core/log"]
+
+# SyncProducer::set_value / set_value_at for Settable types
+data-contracts = ["dep:aimdb-data-contracts"]
+
+# Fork detection only, and only where `pthread_atfork` exists. Optional and
+# activated by `std`, so the no_std build pulls neither libc nor its `std`
+# feature — see `src/fork.rs`.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", default-features = false, optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# `aimdb-core`'s log macros carry a `#[cfg(feature = "defmt")]` arm that
+# expands here; this crate never builds with defmt, so it only names it.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("defmt"))'] }

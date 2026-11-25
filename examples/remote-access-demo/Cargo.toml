@@ -1,0 +1,41 @@
+[package]
+name = "remote-access-demo"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "server"
+path = "src/server.rs"
+
+[[bin]]
+name = "client"
+path = "src/client.rs"
+
+[dependencies]
+aimdb-core = { path = "../../aimdb-core", features = [
+    "std",
+    "tracing",
+    "observability",
+] }
+aimdb-tokio-adapter = { path = "../../aimdb-tokio-adapter", features = [
+    "tokio-runtime",
+    "tracing",
+    "observability",
+] }
+aimdb-client = { path = "../../aimdb-client" }
+aimdb-data-contracts = { path = "../../aimdb-data-contracts", features = [
+    "observable",
+] }
+aimdb-uds-connector = { path = "../../aimdb-uds-connector" }
+aimdb-build-info = { path = "../../aimdb-build-info" }
+tokio = { version = "1.48", features = ["full"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[build-dependencies]
+aimdb-build-info = { path = "../../aimdb-build-info", features = ["build"] }

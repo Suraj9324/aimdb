@@ -1,0 +1,387 @@
+//! # AimDB Data Contracts
+//!
+//! Trait definitions for self-describing data schemas that work identically
+//! across MCU, edge, and cloud.
+//!
+//! This crate provides:
+//! - **Schema types** — Data structures with unique identifiers ([`SchemaType`])
+//! - **Streamable** — Marker for types that cross serialization boundaries ([`Streamable`])
+//! - **Contract profiles** — Configuration for runtime behavior
+//! - **Simulation support** — Generate realistic test data
+//!
+//! ## Design Philosophy
+//!
+//! Contracts separate **what data looks like** (schema) from **how it behaves at runtime**
+//! (policies). This enables:
+//! - Reusable schemas across different deployment configurations
+//! - Type-safe data exchange between systems
+//! - Configurable policies without changing code
+//!
+//! ## Defining a Custom Contract
+//!
+//! ```rust
+//! use aimdb_data_contracts::{SchemaType, Streamable};
+//! use serde::{Serialize, Deserialize};
+//!
+//! #[derive(Clone, Debug, Serialize, Deserialize)]
+//! pub struct MyCustomSensor {
+//!     pub reading: f64,
+//!     pub timestamp: u64,
+//! }
+//!
+//! impl SchemaType for MyCustomSensor {
+//!     const NAME: &'static str = "my_custom_sensor";
+//! }
+//!
+//! // Mark as streamable — can cross WebSocket / WASM boundaries
+//! impl Streamable for MyCustomSensor {}
+//! ```
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(feature = "std")]
+extern crate std;
+
+extern crate alloc;
+
+// The `migration_chain!` proc-macro (aimdb-derive) has no `$crate` and so
+// hardcodes absolute `::aimdb_data_contracts::...` paths in its expansion
+// (matching the `RecordKey` -> `aimdb_core` precedent). That means this
+// crate must be able to resolve itself by its own external name — which a
+// crate cannot do by default (RFC 2126) — for the internal arity-check
+// fixture in `migratable.rs` that invokes the macro from inside this same
+// crate. External callers (doctests, integration tests, downstream
+// consumers) don't need this; it only matters for that one self-reference.
+#[cfg(feature = "migratable")]
+extern crate self as aimdb_data_contracts;
+
+/// Re-exports used by macro-generated code, kept out of the crate's own
+/// namespace so a caller's own `serde_json`/`alloc` (if any) never shadows
+/// or gets shadowed by them — see the `Linkable` and `migration_chain!`
+/// expansions.
+#[doc(hidden)]
+pub mod __private {
+    pub extern crate alloc;
+    #[cfg(feature = "ros2")]
+    pub use aimdb_cdr;
+    #[cfg(feature = "ros2")]
+    pub use aimdb_core::connector::SerializeError;
+    #[cfg(feature = "linkable-json")]
+    pub use serde_json;
+}
+
+mod streamable;
+pub use streamable::Streamable;
+
+mod contract_identity;
+#[doc(hidden)]
+pub use contract_identity::{has_name_id_collision, locked_shape};
+pub use contract_identity::{name_id, ContractShape};
+
+mod catalog;
+pub use catalog::ContractId;
+
+/// Called by the test `catalog!` generates; not an API of its own.
+#[cfg(feature = "lock")]
+#[doc(hidden)]
+pub mod lock;
+
+#[cfg(feature = "aimdb-core")]
+mod key;
+#[cfg(feature = "aimdb-core")]
+pub use key::Key;
+
+#[cfg(feature = "linkable")]
+mod link_codec;
+
+#[cfg(feature = "linkable")]
+mod payload_codec;
+
+#[cfg(feature = "linkable")]
+pub use payload_codec::{PayloadDecoder, PayloadEncoder};
+
+#[cfg(feature = "linkable")]
+mod linkable;
+
+#[cfg(feature = "linkable")]
+pub use link_codec::{link_codecs, LinkCodec, LinkCodecBuilderExt, WireFormat};
+
+#[cfg(feature = "linkable")]
+pub use linkable::{publish, subscribe, LinkCodecRegistrarExt, LinkableRegistrarExt};
+
+/// JSON `#[derive(Linkable)]` (feature `linkable-json`) — see [`Linkable`] and
+/// `aimdb_derive::Linkable`'s docs.
+///
+/// Re-exported under the same name as the trait, following the trait+derive
+/// pairing convention (`serde::Serialize`, `aimdb_derive::RecordKey`) — proc-macro
+/// derive names live in a separate namespace from traits, so this is not a
+/// conflict.
+#[cfg(feature = "linkable-json")]
+pub use aimdb_derive::Linkable;
+
+#[cfg(feature = "ros2")]
+mod ros_message;
+
+#[cfg(feature = "ros2")]
+pub use ros_message::{ros2, RosMessage, RosNameError};
+
+#[cfg(feature = "ros2")]
+pub use aimdb_derive::RosMessage;
+
+#[cfg(feature = "observable")]
+mod observable;
+
+#[cfg(feature = "observable")]
+pub use observable::{log_tap, ObservableRegistrarExt};
+
+#[cfg(feature = "simulatable")]
+mod simulatable;
+
+#[cfg(feature = "migratable")]
+mod migratable;
+
+#[cfg(feature = "migratable")]
+mod admission;
+
+#[cfg(feature = "migratable")]
+mod versioned_links;
+
+#[cfg(feature = "migratable")]
+pub use aimdb_core::EnvelopeCarrier;
+#[cfg(feature = "migratable")]
+pub use versioned_links::{
+    EnvelopeLinkExt, VersionedCodecBuilderExt, VersionedInboundExt, VersionedOutboundExt,
+};
+
+#[cfg(feature = "migratable")]
+pub use admission::{admit, admit_frame, Admit, LinkContract};
+
+#[cfg(feature = "simulatable")]
+pub use simulatable::{RandomWalkParams, SimProfile, Simulatable, SimulatableRegistrarExt};
+
+#[cfg(feature = "migratable")]
+pub use migratable::{MigrationChain, MigrationError, MigrationStep, Reaches, VersionOf};
+
+#[cfg(feature = "migratable")]
+pub use aimdb_derive::migration_chain;
+
+// ═══════════════════════════════════════════════════════════════════
+// SCHEMA TRAITS (Implementation-defined)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Identity and metadata for a data contract.
+///
+/// Every schema type has a unique name and version used for:
+/// - Record registration in AimDB
+/// - Profile matching in contract configurations
+/// - Wire protocol identification
+/// - Version compatibility checking
+///
+/// # Versioning and Backward Compatibility
+///
+/// The `VERSION` constant tracks schema evolution. When following backward
+/// compatibility rules, a server running version N can safely ingest data
+/// from producers running any version 1..=N.
+///
+/// ## Compatibility Rules
+///
+/// | Change Type | Allowed? | Example |
+/// |-------------|----------|---------|
+/// | Add optional field | ✅ Yes | `#[serde(default)]` new field |
+/// | Add field with default | ✅ Yes | New field deserializes to default |
+/// | Remove unused field | ✅ Yes | Old data with field still parses |
+/// | Rename field | ⚠️ Migration | Use `MigrationStep` + `migration_chain!` |
+/// | Change field type | ⚠️ Migration | Use `MigrationStep` + `migration_chain!` |
+/// | Add required field | ⚠️ Migration | Use `MigrationStep` + `migration_chain!` |
+///
+/// For breaking changes, implement `MigrationStep` and use `migration_chain!` (requires `migratable` feature)
+/// to provide runtime transformation of older data formats. `migratable` only requires `alloc` — schema
+/// migration works identically on `no_std` targets (e.g. Embassy on an MCU) and on `std`.
+///
+/// Whether `VERSION` was bumped is checked by [`catalog!`]: it locks the wire shape of every
+/// `NAME@VERSION` in a committed `aimdb.lock`, and a shape changed under the same identity fails
+/// the contracts crate's tests.
+pub trait SchemaType: Sized {
+    /// Unique identifier for this schema (e.g., "temperature", "humidity")
+    const NAME: &'static str;
+
+    /// Schema version. Defaults to 1.
+    ///
+    /// Increment when adding new optional/defaulted fields.
+    const VERSION: u32 = 1;
+}
+
+/// Construct a schema instance from its primary value.
+///
+/// This defines the canonical way to create a new reading/measurement — the
+/// write counterpart to [`Observable::signal`]'s read projection. Implementing
+/// it unlocks the `SyncProducer::set_value` family in `aimdb-sync`.
+#[cfg(feature = "settable")]
+pub trait Settable: SchemaType {
+    /// The primary value type (e.g., `f32` for temperature)
+    type Value;
+
+    /// Create a new instance from a value.
+    ///
+    /// # Parameters
+    /// - `value`: The primary data value
+    /// - `timestamp`: Unix timestamp in milliseconds
+    fn set(value: Self::Value, timestamp: u64) -> Self;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// OBSERVABLE SUPPORT
+// ═══════════════════════════════════════════════════════════════════
+
+/// Project a schema type onto a numeric domain signal.
+///
+/// The trait's kernel is the numeric projection: implement it, call
+/// `ObservableRegistrarExt::observe` (unlinked — it exists only behind the
+/// `observable` feature),
+/// and the signal is folded into live last/min/max/mean statistics that surface
+/// on `record.list` / `record.get` and stage profiling. The signal can also feed
+/// threshold checks, alerting, and aggregation.
+///
+/// Presentation is not part of the trait: `.log(node_id)` (also on the ext
+/// trait) formats a human-readable line from `Debug` +
+/// [`SIGNAL`](Observable::SIGNAL)/[`UNIT`](Observable::UNIT).
+///
+/// # Feature layering
+///
+/// Three layers, each useful without the next:
+///
+/// 1. **This trait** — always compiled, no features. [`signal()`](Observable::signal)
+///    plus the `SIGNAL`/`UNIT` labels are enough for hand-wired `.tap()`s,
+///    threshold checks, and generic code over `T: Observable`.
+/// 2. **`observable` (this crate)** — unlocks the registrar verbs `.observe()`
+///    and `.log()`. Gated only because the ext trait needs `alloc` and
+///    `aimdb-core`.
+/// 3. **`observability` (`aimdb-core`)** — the metrics backend. When it is off,
+///    `.observe()` still compiles and runs but its gauge is inert: updates are
+///    no-ops and nothing surfaces on `record.list` / `record.get` (see
+///    `RecordRegistrar::signal_gauge`). `.log()` is unaffected. This lets
+///    constrained targets ship `Observable` contracts while compiling the
+///    metrics cost away.
+pub trait Observable: SchemaType {
+    /// The numeric type of the signal (e.g., `f32`, `f64`, `i32`).
+    ///
+    /// Must be comparable and copyable for threshold checks. `.observe()`
+    /// additionally requires `Signal: Into<f64>` at its call site; a type with
+    /// an exotic signal can still implement `Observable` and write its own tap.
+    type Signal: PartialOrd + Copy;
+
+    /// What the signal means, for metrics/UI labels (e.g. `"celsius"`).
+    /// Defaults to the schema name.
+    const SIGNAL: &'static str = Self::NAME;
+
+    /// Unit label for the signal (e.g. `"°C"`, `"%"`, `"hPa"`).
+    const UNIT: &'static str = "";
+
+    /// Extract the signal value from this instance.
+    fn signal(&self) -> Self::Signal;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LINKABLE SUPPORT (feature = "linkable")
+// ═══════════════════════════════════════════════════════════════════
+
+/// Types that can be serialized/deserialized for connector links.
+///
+/// Implement this trait, then link records with [`publish`] / [`subscribe`]
+/// on a connector handle, or with [`LinkableRegistrarExt::linked_from`] /
+/// [`linked_to`](linkable::LinkableRegistrarExt::linked_to) from a full URL,
+/// in AimDB connectors (MQTT, KNX, etc.) with the codec defaulted to
+/// `from_bytes`/`to_bytes`. This provides the wire format for transporting
+/// schema types across network boundaries.
+///
+/// The `linkable` feature is format-neutral. Enable `linkable-json` for the
+/// JSON `#[derive(Linkable)]` convenience, or implement these methods directly
+/// for another default format. To select a different format on each route, use
+/// [`LinkCodecRegistrarExt::linked_from_with`] /
+/// [`LinkCodecRegistrarExt::linked_to_with`] with a custom [`LinkCodec`] or the
+/// feature-gated `link_codecs::Json` and `link_codecs::Postcard` markers.
+///
+/// # Example
+///
+/// Not compiled: the snippet needs `aimdb-core`'s builder types in scope.
+///
+/// ```rust,ignore
+/// use aimdb_data_contracts::{subscribe, Key};
+/// use my_app::Temperature;  // user-defined type implementing Linkable
+///
+/// let mqtt = builder.connect(MqttConnector::new(broker_url));
+/// builder.configure(Key::<Temperature>::interned(NODE_ID), |reg| {
+///     reg.buffer(BufferCfg::SingleLatest)
+///         .input(subscribe(mqtt, "sensors/temperature"));
+/// });
+/// ```
+#[cfg(feature = "linkable")]
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a `Linkable` contract",
+    label = "`{Self}` has no wire format",
+    note = "`publish`, `subscribe` and the `linked_*` verbs encode with the record's own codec: derive or implement `Linkable` for `{Self}`"
+)]
+pub trait Linkable: SchemaType + Sized {
+    /// Decode one value and report how many bytes it consumed.
+    ///
+    /// Inbound links reject a frame with unconsumed bytes as `decode_error`.
+    /// The default reports the whole input, which is right when `from_bytes`
+    /// already rejects trailing data (as `serde_json::from_slice` does). A
+    /// `from_bytes` that tolerates trailing bytes should override this with
+    /// the real count, as `#[derive(RosMessage)]` does for CDR.
+    fn from_bytes_with_consumed(data: &[u8]) -> Result<(Self, usize), alloc::string::String> {
+        Self::from_bytes(data).map(|value| (value, data.len()))
+    }
+
+    /// Preferred reusable scratch capacity for [`encode_into`](Self::encode_into).
+    ///
+    /// `None` keeps outbound links on the existing owned-`Vec` serializer.
+    /// Implementations that override `encode_into` with an allocation-free path
+    /// can advertise `Some(bytes)` so [`LinkableRegistrarExt::linked_to`] installs
+    /// the bounded scratch-buffer fast path. An undersized scratch buffer is a
+    /// performance fallback, not a correctness failure: the connector pipeline
+    /// retries that value through [`to_bytes`](Self::to_bytes).
+    const ENCODE_BUFFER_CAPACITY: Option<usize> = None;
+
+    /// What [`to_bytes`](Self::to_bytes) / [`from_bytes`](Self::from_bytes) speak.
+    /// Recorded on links that use this impl as their codec.
+    const WIRE_FORMAT: WireFormat = WireFormat::Unspecified;
+
+    /// Deserialize from bytes (e.g., MQTT payload).
+    ///
+    /// Returns `Err` with error message on parse failure.
+    fn from_bytes(data: &[u8]) -> Result<Self, alloc::string::String>;
+
+    /// Serialize to bytes (e.g., for MQTT payload).
+    ///
+    /// Returns `Err` with error message on serialization failure.
+    fn to_bytes(&self) -> Result<alloc::vec::Vec<u8>, alloc::string::String>;
+
+    /// Serialize into caller-owned storage and return the number of bytes used.
+    ///
+    /// The default implementation preserves source compatibility for existing
+    /// `Linkable` implementations by calling [`to_bytes`](Self::to_bytes) and
+    /// copying the result after a checked bounds test. It is therefore not
+    /// allocation-free. Implementations such as generated Postcard records can
+    /// override this method and set [`ENCODE_BUFFER_CAPACITY`](Self::ENCODE_BUFFER_CAPACITY)
+    /// to enable the allocation-free outbound fast path.
+    ///
+    /// On success, bytes after the returned length are left untouched. On any
+    /// error, callers must treat the contents of `buf` as unspecified: a true
+    /// streaming encoder may have written a prefix before discovering that the
+    /// buffer is too small. The compatibility implementation below performs a
+    /// checked copy and therefore leaves `buf` untouched on
+    /// [`SerializeError::BufferTooSmall`].
+    ///
+    /// [`SerializeError::BufferTooSmall`]: aimdb_core::connector::SerializeError::BufferTooSmall
+    fn encode_into(&self, buf: &mut [u8]) -> Result<usize, aimdb_core::connector::SerializeError> {
+        use aimdb_core::connector::SerializeError;
+
+        let bytes = self.to_bytes().map_err(|_| SerializeError::InvalidData)?;
+        let out = buf
+            .get_mut(..bytes.len())
+            .ok_or(SerializeError::BufferTooSmall)?;
+        out.copy_from_slice(&bytes);
+        Ok(bytes.len())
+    }
+}

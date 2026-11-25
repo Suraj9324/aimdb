@@ -1,0 +1,35 @@
+[package]
+name = "mqtt-connector-demo-common"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Shared business logic for MQTT demos - runs on MCU, edge, and cloud"
+
+[features]
+default = []
+std = ["aimdb-core/std", "aimdb-data-contracts/std", "serde/std"]
+# Embassy-specific features (no_std)
+defmt = ["dep:defmt"]
+
+[dependencies]
+# Core AimDB - runtime agnostic; `derive` for the `RecordKey` keys
+aimdb-core = { path = "../../aimdb-core", default-features = false, features = [
+    "alloc",
+    "derive",
+] }
+# The contracts' wire format: JSON `#[derive(Linkable)]`, `no_std + alloc`
+# compatible (serde_json's alloc-only configuration), for publish/subscribe
+aimdb-data-contracts = { path = "../../aimdb-data-contracts", default-features = false, features = [
+    "linkable-json",
+] }
+# Serialize/Deserialize on the contracts: the wire format, and remote access
+serde = { workspace = true }
+
+# Optional defmt for embedded logging
+defmt = { workspace = true, optional = true }
+
+[dev-dependencies]
+# `catalog!` (types.rs) checks `aimdb.lock` in this crate's tests; the
+# check is dev-only, so firmware builds never see it.
+aimdb-data-contracts = { path = "../../aimdb-data-contracts", features = ["lock"] }

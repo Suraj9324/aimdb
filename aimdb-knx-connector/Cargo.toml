@@ -1,0 +1,81 @@
+[package]
+name = "aimdb-knx-connector"
+version = "0.6.0"
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "KNX/IP connector for AimDB - building automation integration for Tokio and Embassy runtimes"
+keywords = ["knx", "knxnet-ip", "building-automation", "iot", "connector"]
+categories = ["network-programming", "embedded", "asynchronous"]
+
+[features]
+default = ["aimdb-core/alloc"]
+
+# The whole connector: the sans-io tunnel engine, the unified connection task,
+# and `KnxConnector` over core's `DatagramBinder`/`Delay`. `src/` names no
+# adapter and no `std::`, so one gate covers every target. A runtime is chosen
+# by passing an adapter's binder and clock — a dependency the caller adds, not a
+# feature here — which is what lets a third runtime (FreeRTOS/lwIP) use this
+# crate with no edit to it.
+connector = [
+    "aimdb-core/alloc",
+    "aimdb-core/connector-session", # `DatagramBinder`/`Datagram`/`Delay`
+]
+
+# Orthogonal to `connector`: the code is `alloc`-only either way, so this only
+# lifts `no_std`, forwards core's own `std`, and adds knx-pico's std error impls
+# plus the back-compat DPT re-exports.
+std = ["connector", "aimdb-core/std", "knx-pico/std"]
+
+# Deprecated aliases. They name executors this crate never mentions, which
+# blocks a FreeRTOS/lwIP build from enabling the connector without claiming to
+# be Embassy. Kept so existing consumers keep working; remove after a release.
+tokio-runtime = ["std"]
+embassy-runtime = ["connector"]
+
+# Deprecated no-op. It selected `critical-section`'s std impl for the
+# channels the connector used to take; nothing here needs one any more. Kept
+# so existing consumers keep building; remove after a release.
+critical-section-std-impl = []
+
+# Design 050 §10.4/§10.5: the facade reaches both destinations through
+# `aimdb_core::__private`, so neither dependency is declared here any more.
+# The *features* stay: a `#[cfg]` in a `#[macro_export]`ed macro is resolved
+# where it expands, so without them this crate would emit nothing.
+tracing = ["aimdb-core/tracing"]
+log = ["aimdb-core/log"]
+defmt = ["dep:defmt", "defmt/ip_in_core", "aimdb-core/defmt", "knx-pico/defmt"]
+
+[dependencies]
+defmt = { workspace = true, optional = true }
+aimdb-core = { version = "3.0.0", path = "../aimdb-core", default-features = false }
+
+# aimdb-dev fork: upstream 0.3.0 panics on an npdu_length=1 telegram. A patch
+# won't do — patches aren't published, so dependants resolve back to upstream.
+# Keyed `knx-pico` to keep imports and feature references unchanged.
+knx-pico = { package = "aimdb-knx-pico", version = "0.3.1", default-features = false }
+
+# Executor-independent, despite the name: it pulls no executor and builds on
+# std, so one select serves every runtime. Its `[dependencies]` is empty bar
+# optional defmt/log, so the std graph is unaffected.
+embassy-futures = { version = "0.1.2" }
+
+# Embedded utilities (heapless is unconditional: the shared sans-io tunnel
+# engine uses stack-allocated frames on both runtimes)
+heapless = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tokio-test = "0.4"
+aimdb-tokio-adapter = { path = "../aimdb-tokio-adapter", features = [
+    "tokio-runtime",
+    # `TokioNet`/`TokioDelay`, the neutral transports the unified task runs on.
+    "net",
+] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

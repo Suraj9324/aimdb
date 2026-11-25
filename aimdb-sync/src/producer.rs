@@ -1,0 +1,223 @@
+//! Synchronous producer for typed records.
+
+use crate::runtime::Runtime;
+use crate::{SyncError, SyncResult};
+use alloc::sync::Weak;
+use core::fmt::Debug;
+use core::marker::PhantomData;
+
+/// Synchronous producer for records of type `T`.
+///
+/// Thread-safe, can be cloned and shared across threads.
+/// Values are moved (not cloned) directly into the record's buffer.
+///
+/// # Thread Safety
+///
+/// Multiple clones of `SyncProducer<T>` can be used concurrently from
+/// different threads. Each `set()` operation is independent and thread-safe.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use aimdb_sync::*;
+/// # use serde::{Serialize, Deserialize};
+/// # #[derive(Clone, Debug, Serialize, Deserialize)]
+/// # struct Temperature { celsius: f32 }
+/// # fn example(producer: &SyncProducer<Temperature>) -> SyncResult<()> {
+/// // Set a value synchronously
+/// producer.set(Temperature { celsius: 25.0 })?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone)]
+pub struct SyncProducer<T>
+where
+    T: Send + Sync + 'static + Debug + Clone,
+{
+    /// The runtime this producer publishes into.
+    ///
+    /// `Weak`, so the handle's lifetime still governs: when it goes, the
+    /// database goes with it and this upgrade fails. That failure *is* the
+    /// liveness check — see [`crate::runtime`] on why sharing ownership here
+    /// would cost more than it bought.
+    ///
+    /// # Why this is not a `Guarded`, as the consumer's reader is
+    ///
+    /// [`Guarded`](crate::runtime::Guarded) exists to put a check in front of a
+    /// resource nothing else gates. A consumer owns one: its `Reader` is its
+    /// own, and `try_get` reads straight out of it without touching the
+    /// runtime. A producer owns no such thing — a key and a `PhantomData`. The
+    /// only resource it reaches is the database, and that already lives behind
+    /// [`Runtime::db`](crate::runtime::Runtime::db), private to that module and
+    /// checked on the way through. Wrapping the key would mean checking to
+    /// reach a `String` and then checking again to reach the database: an extra
+    /// hop, no extra guarantee.
+    ///
+    /// The two also want opposite answers when the upgrade fails. A consumer
+    /// must carry on — its buffer may still hold data, which is why
+    /// `RuntimeRef::check` returns `Ok` there. A producer must refuse: there is
+    /// nothing left to publish into. Sharing one wrapper would mean
+    /// parameterising that policy, which costs more than the hop it saves.
+    rt: Weak<Runtime>,
+    key: String,
+    // same reasons as for Producer in aimdb-core/src/typed_api.rs
+    _phantom: PhantomData<fn() -> T>,
+}
+
+impl<T> SyncProducer<T>
+where
+    T: Send + Sync + 'static + Debug + Clone,
+{
+    /// Create a new sync producer (internal use only)
+    pub(crate) fn new(rt: Weak<Runtime>, key: impl AsRef<str>) -> Self {
+        Self {
+            rt,
+            key: key.as_ref().into(),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// The runtime, or [`SyncError::RuntimeShutdown`] if it is gone.
+    ///
+    /// Every publish goes through here and then through
+    /// [`Runtime::db`](crate::runtime::Runtime::db), so the fork check cannot
+    /// be skipped by adding a method and forgetting to guard it.
+    #[inline]
+    fn runtime(&self) -> SyncResult<alloc::sync::Arc<Runtime>> {
+        self.rt.upgrade().ok_or(SyncError::RuntimeShutdown)
+    }
+
+    /// Whether a publish through this producer can still reach the database.
+    ///
+    /// `Ok(())` means [`set`](Self::set) reaches the record graph — not that it
+    /// succeeds; an unregistered key still fails there. Otherwise
+    /// [`SyncError::RuntimeShutdown`] or [`SyncError::ForkedChild`].
+    ///
+    /// This is the check [`set`](Self::set) performs, not a second one beside
+    /// it, so the answer cannot drift from what a publish would find. It takes
+    /// no lock — a [`Weak`] upgrade and one relaxed atomic load — so a facade
+    /// can ask it while its own teardown holds the handle's lock.
+    #[inline]
+    pub fn check(&self) -> SyncResult<()> {
+        self.runtime()?.check()
+    }
+
+    /// Set a value synchronously.
+    ///
+    /// Checks the runtime, finds the record by key, checks its type, and writes
+    /// directly to its buffer. This method does not wait for buffer space.
+    /// Every current buffer overwrites according to its configured behavior.
+    ///
+    /// # Errors
+    ///
+    /// - [`SyncError::RuntimeShutdown`] if the runtime has shut down.
+    /// - [`SyncError::ForkedChild`] if this producer was inherited across a
+    ///   Unix `fork()` without its runtime thread.
+    /// - [`SyncError::Db`] if the key is not registered or names a different
+    ///   record type.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use aimdb_core::AimDbBuilder;
+    /// use aimdb_sync::{AimDbBuilderSyncExt, SyncResult};
+    /// use aimdb_tokio_adapter::TokioAdapter;
+    /// use std::sync::Arc;
+    ///
+    /// # #[derive(Debug, Clone)]
+    /// # struct MyData { value: i32 }
+    /// # fn main() -> SyncResult<()> {
+    /// let handle = AimDbBuilder::new()
+    ///     .runtime(Arc::new(TokioAdapter))
+    ///     .attach()?;
+    /// let record_1 = aimdb_core::Name::<MyData>::new("my_data");
+    /// let producer = handle.producer(record_1)?;
+    /// producer.set(MyData { value: 42 })?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set(&self, value: T) -> SyncResult<()> {
+        let rt = self.runtime()?;
+        let record_key_1 = aimdb_core::Name::<T>::new(&self.key);
+        rt.db()?.produce(record_key_1, value).map_err(SyncError::Db)
+    }
+}
+
+/// Set-by-primitive verbs for `Settable` types (feature `data-contracts`).
+///
+/// Where [`set`](Self::set) takes a fully constructed `T`, `set_value`
+/// constructs it via `T::set(value, timestamp)` and sends, in one call.
+/// Distinct from AimX's `record.set {name, value}` (full JSON value through
+/// `JsonCodec`) — this is set-by-primitive.
+#[cfg(feature = "data-contracts")]
+impl<T> SyncProducer<T>
+where
+    T: aimdb_data_contracts::Settable + Send + Sync + 'static + Debug + Clone,
+{
+    /// Construct via `T::set(value, now)` and send via [`set`](Self::set).
+    ///
+    /// Stamps with the *caller's* `SystemTime` (sample time at the edge), not
+    /// the engine's `ctx.time()` — use [`set_value_at`](Self::set_value_at) for
+    /// explicit-timestamp control (replay, testing).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use aimdb_sync::SyncResult;
+    /// # fn main() -> SyncResult<()> {
+    /// use aimdb_core::AimDbBuilder;
+    /// use aimdb_data_contracts::{SchemaType, Settable};
+    /// use aimdb_sync::AimDbBuilderSyncExt;
+    /// use aimdb_tokio_adapter::TokioAdapter;
+    /// use std::sync::Arc;
+    ///
+    /// #[derive(Debug, Clone)]
+    /// struct Temperature { celsius: f32, timestamp: u64 }
+    ///
+    /// impl SchemaType for Temperature {
+    ///     const NAME: &'static str = "temperature";
+    /// }
+    ///
+    /// impl Settable for Temperature {
+    ///     type Value = f32;
+    ///     fn set(value: f32, timestamp: u64) -> Self {
+    ///         Temperature { celsius: value, timestamp }
+    ///     }
+    /// }
+    ///
+    /// let handle = AimDbBuilder::new().runtime(Arc::new(TokioAdapter)).attach()?;
+    /// let record_2 = aimdb_core::Name::<Temperature>::new("temperature");
+    /// let producer = handle.producer(record_2)?;
+    /// producer.set_value(22.5)?; // constructs Temperature::set(22.5, now_ms) and sends
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_value(&self, value: T::Value) -> SyncResult<()> {
+        self.set(T::set(value, unix_now_ms()))
+    }
+
+    /// Explicit-timestamp variant (replay, testing).
+    pub fn set_value_at(&self, value: T::Value, timestamp_ms: u64) -> SyncResult<()> {
+        self.set(T::set(value, timestamp_ms))
+    }
+}
+
+/// Current wall-clock time as Unix milliseconds (caller-side clock).
+#[cfg(feature = "data-contracts")]
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+    #[allow(dead_code)]
+    fn check<X: Send + Sync + 'static + core::fmt::Debug + Clone>() {
+        assert_send::<crate::SyncProducer<X>>();
+        assert_sync::<crate::SyncProducer<X>>();
+    }
+}

@@ -1,0 +1,30 @@
+[package]
+name = "aimdb-persistence-sqlite"
+version = "0.3.0"
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "SQLite persistence backend for AimDB"
+keywords = ["database", "persistence", "sqlite"]
+categories = ["database-implementations"]
+
+[features]
+default = []
+tracing = ["aimdb-core/tracing"]
+log = ["aimdb-core/log"]
+
+[dependencies]
+aimdb-core = { version = "3.0.0", path = "../aimdb-core", default-features = false, features = ["alloc"] }
+aimdb-persistence = { version = "0.3.0", path = "../aimdb-persistence" }
+rusqlite = { version = "0.43", features = ["bundled"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tempfile = "3"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("defmt"))'] }

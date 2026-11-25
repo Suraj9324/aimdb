@@ -1,0 +1,126 @@
+//! Shared Data Types for MQTT Demo
+//!
+//! The demo's contracts. They work in both `std` and `no_std` environments
+//! using `alloc::string::String`, and their wire format is JSON through
+//! `#[derive(Linkable)]` on every target, so `publish` / `subscribe` and
+//! remote access use the same encoding on Tokio and Embassy.
+
+extern crate alloc;
+
+use alloc::string::String;
+
+use aimdb_data_contracts::{Linkable, SchemaType};
+use serde::{Deserialize, Serialize};
+
+// The demo's contracts, locked in `aimdb.lock`: the same `NAME@VERSION`
+// always has the same wire shape. Enums nested in a contract would go in
+// `helpers`; these contracts have none.
+aimdb_data_contracts::catalog! {
+    contracts: [Temperature, TemperatureCommand, ButtonPress],
+    helpers: [],
+}
+
+// ============================================================================
+// TEMPERATURE READING
+// ============================================================================
+
+/// Temperature reading from a sensor
+///
+/// Represents a temperature measurement that can be published to MQTT.
+#[derive(Clone, Debug, Serialize, Deserialize, Linkable)]
+pub struct Temperature {
+    /// Sensor identifier (e.g., "indoor-001", "outdoor-001")
+    pub sensor_id: String,
+    /// Temperature in degrees Celsius
+    pub celsius: f32,
+}
+
+impl SchemaType for Temperature {
+    const NAME: &'static str = "mqtt_demo.temperature";
+}
+
+impl Temperature {
+    /// Create a new temperature reading
+    pub fn new(sensor_id: &str, celsius: f32) -> Self {
+        Self {
+            sensor_id: sensor_id.into(),
+            celsius,
+        }
+    }
+
+    /// Get icon based on sensor type
+    pub fn icon(&self) -> &'static str {
+        if self.sensor_id.starts_with("indoor") {
+            "🏠"
+        } else if self.sensor_id.starts_with("outdoor") {
+            "🌳"
+        } else if self.sensor_id.starts_with("server") {
+            "🖥️"
+        } else {
+            "📊"
+        }
+    }
+}
+
+// ============================================================================
+// TEMPERATURE COMMAND
+// ============================================================================
+
+/// Command for controlling temperature sensors (inbound from MQTT)
+#[derive(Clone, Debug, Serialize, Deserialize, Linkable)]
+pub struct TemperatureCommand {
+    /// Action to perform (e.g., "read", "calibrate", "reset")
+    pub action: String,
+    /// Target sensor identifier
+    pub sensor_id: String,
+}
+
+impl SchemaType for TemperatureCommand {
+    const NAME: &'static str = "mqtt_demo.temperature_command";
+}
+
+impl TemperatureCommand {
+    /// Create a new temperature command
+    pub fn new(action: &str, sensor_id: &str) -> Self {
+        Self {
+            action: action.into(),
+            sensor_id: sensor_id.into(),
+        }
+    }
+}
+
+// ============================================================================
+// BUTTON PRESS
+// ============================================================================
+
+/// What a push button yields: one press. A driver's event, not a contract;
+/// contracts are built from it with `From`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ButtonEvent {
+    /// Which button (e.g. "b1").
+    pub button: &'static str,
+    /// Presses since start, counting from 1.
+    pub press: u32,
+}
+
+/// A button press (outbound to MQTT)
+#[derive(Clone, Debug, Serialize, Deserialize, Linkable)]
+pub struct ButtonPress {
+    /// Button identifier (e.g. "b1")
+    pub button: String,
+    /// Presses since start, counting from 1
+    pub press: u32,
+}
+
+impl SchemaType for ButtonPress {
+    const NAME: &'static str = "mqtt_demo.button_press";
+}
+
+impl From<ButtonEvent> for ButtonPress {
+    fn from(event: ButtonEvent) -> Self {
+        Self {
+            button: event.button.into(),
+            press: event.press,
+        }
+    }
+}

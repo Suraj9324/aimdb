@@ -1,0 +1,21 @@
+{
+    "servers": {
+        "aimdb-weather": {
+            "type": "http",
+            "url": "http://aimdb.dev/mcp"
+        },
+        "aimdb-local": {
+            "type": "stdio",
+            "command": "cargo",
+            "args": [
+                "run",
+                "--manifest-path",
+                "${workspaceFolder}/tools/aimdb-mcp/Cargo.toml",
+                "--",
+                "--connect",
+                "unix:///tmp/aimdb-demo.sock",
+                "--allow-writes"
+            ]
+        }
+    }
+}

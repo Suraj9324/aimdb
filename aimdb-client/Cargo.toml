@@ -1,0 +1,65 @@
+[package]
+name = "aimdb-client"
+version = "0.8.0"
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "AimX protocol client for remote AimDB introspection and management"
+keywords = ["client", "protocol", "database", "remote", "rpc"]
+categories = ["database", "network-programming"]
+
+[features]
+default = ["transport-uds"]
+observability = ["aimdb-core/observability"]
+
+# Transports the endpoint resolver (`crate::endpoint`) can dial. Each gates its
+# connector dep + the matching `dial`/`parse` arm; an endpoint whose scheme isn't
+# compiled in is rejected at resolve time.
+transport-uds = ["dep:aimdb-uds-connector"]
+transport-serial = ["dep:aimdb-serial-connector"]
+# The TCP dialer comes from the adapter's `net` transports.
+transport-tcp = ["dep:aimdb-tcp-connector", "aimdb-tokio-adapter/net"]
+
+[dependencies]
+# Core dependencies - protocol types from aimdb-core. `connector-session`
+# exposes the shared session engine (`run_client`/`ClientHandle`) plus the AimX
+# codec that the engine-based client (`crate::engine`) builds on.
+aimdb-core = { version = "3.0.0", path = "../aimdb-core", features = [
+    "std",
+    "connector-session",
+] }
+
+# The build-info layout's limits, to bound a post-link download.
+aimdb-build-info = { version = "0.1.0", path = "../aimdb-build-info" }
+
+# Transports the resolver dials over, each behind its `transport-*` feature so a
+# binary links only what it needs.
+aimdb-uds-connector = { version = "0.2.0", path = "../aimdb-uds-connector", optional = true }
+aimdb-serial-connector = { version = "0.2.0", path = "../aimdb-serial-connector", default-features = false, features = [
+    "std",
+], optional = true }
+aimdb-tcp-connector = { version = "0.2.0", path = "../aimdb-tcp-connector", default-features = false, features = [
+    "tokio-runtime",
+], optional = true }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime (must match AimDB runtime)
+tokio = { version = "1", features = ["net", "io-util", "macros", "fs", "time"] }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+# Supplies the `TimeOps` clock the engine-based client hands to `run_client`
+# (reconnect backoff / keepalive). This client always drives the engine on tokio.
+aimdb-tokio-adapter = { version = "0.8.0", path = "../aimdb-tokio-adapter" }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+tokio-test = "0.4"
+tempfile = "3"

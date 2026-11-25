@@ -1,0 +1,87 @@
+[package]
+name = "aimdb-data-contracts"
+version = "0.3.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Trait definitions for AimDB data contracts: SchemaType, Streamable, Observable, Linkable, Simulatable, Migratable, Settable"
+keywords = ["aimdb", "iot", "edge", "schema", "contracts"]
+categories = ["embedded", "no-std"]
+
+[features]
+default = ["std"]
+alloc = ["serde/alloc"]
+std = ["alloc", "serde/std", "serde_json?/std"]
+# Format-neutral connector contract plus registrar verbs. Concrete codecs live
+# at the application/codegen edge, so Postcard/custom builds stay JSON-free.
+linkable = ["alloc", "aimdb-core"]
+# JSON convenience layered over the format-neutral contract. The derive emits
+# serde_json calls through this crate's private re-export.
+linkable-json = ["linkable", "serde_json", "dep:aimdb-derive"]
+# Compact binary codec with a caller-chosen bounded scratch capacity. Postcard
+# stays optional and no_std-compatible; `alloc` supplies the correctness
+# fallback for values larger than the preferred route buffer.
+linkable-postcard = ["linkable", "dep:postcard"]
+# OMG CDR (XCDR1), the ROS 2 wire format, with a bounded scratch capacity.
+linkable-cdr = ["linkable", "dep:aimdb-cdr"]
+# ROS 2 message identity (`RosMessage`) for `ros2://` links.
+ros2 = ["linkable-cdr", "dep:aimdb-derive"]
+# Dev-tier — never a default feature. The ext trait needs core's registrar,
+# same coupling `observable` has. `rand` is the tracer CI uses to prove a
+# production graph is sim-free (`make check-no-sim`).
+simulatable = ["rand", "aimdb-core"]
+migratable = ["linkable", "dep:aimdb-derive"]
+observable = ["alloc", "aimdb-core"]
+# Feature-gated for tier symmetry with the other wire contracts. A pure trait —
+# no dependencies of its own.
+settable = []
+# Dev-tier — enable in a contracts crate's `[dev-dependencies]` only. The
+# `aimdb.lock` check that `catalog!` generates for the crate's own tests:
+# traces each contract's wire shape through serde and compares its hash
+# with the committed lock. Never reaches a firmware build (resolver 2).
+lock = ["std", "dep:serde-reflection", "dep:sha2", "dep:toml"]
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
+postcard = { version = "1.0", default-features = false, features = [
+    "alloc",
+], optional = true }
+aimdb-cdr = { version = "0.1.0", path = "../aimdb-cdr", optional = true, default-features = false, features = [
+    "alloc",
+] }
+
+# migration_chain! + #[derive(Linkable)] proc-macros (build-time only; no
+# target/runtime/no_std impact — see aimdb-derive). No cycle: aimdb-derive
+# emits token paths to this crate but does not depend on it.
+aimdb-derive = { version = "0.3.0", path = "../aimdb-derive", optional = true }
+
+# Optional: shared by the `linkable`, `observable`, and `simulatable` registrar
+# ext traits (RecordRegistrar/RuntimeContext). 1.2.0 is the true minimum: the
+# `observable` feature's `.observe()` calls `RecordRegistrar::signal_gauge`,
+# added in 1.2.0. Note: aimdb-core requires the alloc feature for core
+# functionality.
+aimdb-core = { version = "3.0.0", path = "../aimdb-core", optional = true, default-features = false, features = [
+    "alloc",
+] }
+# `lock` only: tracing the wire shape, its hash, and reading `aimdb.lock`.
+serde-reflection = { version = "0.7", optional = true }
+sha2 = { version = "0.11", optional = true }
+toml = { version = "1", optional = true, default-features = false, features = ["std", "serde", "parse"] }
+# RNG is caller-supplied, so we need only the `Rng`/`RngExt` traits and the
+# always-available `SmallRng` — no `std_rng`.
+[dependencies.rand]
+version = "0.10.1"
+optional = true
+default-features = false
+
+[dev-dependencies]
+# For the `tests/compile-fail-links` cases: trybuild sees dev-dependencies,
+# not optional ones.
+aimdb-core = { path = "../aimdb-core", default-features = false, features = ["alloc", "remote"] }
+futures = { workspace = true }
+serde_json = "1.0"
+trybuild = "1.0"

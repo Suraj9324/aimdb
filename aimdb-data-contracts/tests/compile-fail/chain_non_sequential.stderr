@@ -1,0 +1,10 @@
+error[E0080]: evaluation panicked: migration steps must be sequential
+  --> tests/compile-fail/chain_non_sequential.rs:64:1
+   |
+64 | / migration_chain! {
+65 | |     type Current = SeqCurrent;
+66 | |     steps {
+67 | |         SeqStep1: SeqV1 => SeqV2,
+...  |
+70 | | }
+   | |_^ evaluation of `_` failed here

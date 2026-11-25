@@ -1,0 +1,287 @@
+//! AimX Protocol Message Types
+//!
+//! Defines the method-level payloads for the remote access protocol: the
+//! hello/welcome handshake bodies and the instance-info, build and post-link
+//! replies.
+//! These ride the **AimX** NDJSON envelope; the wire framing itself lives
+//! in [`crate::session::aimx`] (feature `connector-session`). See
+//! `docs/design/remote-access-via-connectors.md` for the architecture.
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+
+/// Version of the AimX wire protocol spoken by this crate.
+pub const PROTOCOL_VERSION: &str = "4.0";
+
+/// Query-parameter name a WebSocket client uses to declare its
+/// [`PROTOCOL_VERSION`] at the HTTP upgrade. The socket transports gate the
+/// version inside the `hello` handshake, but a browser cannot set custom
+/// headers on the WebSocket handshake **and** the WS server runs
+/// `reads_hello:false`, so the WS upgrade carries the version in the URL
+/// instead (`…/ws?v=4.0`) and the server refuses an incompatible/absent one
+/// before the socket opens. See [`ws_url_with_version`].
+pub const VERSION_PARAM: &str = "v";
+
+/// Append this crate's [`PROTOCOL_VERSION`] as the [`VERSION_PARAM`] query
+/// parameter to a WebSocket upgrade `url`, joining with `&` if `url` already
+/// carries a query string and `?` otherwise. Every first-party WS client
+/// dialer routes its URL through this so the server's upgrade-time gate sees a
+/// version; keeping the `NAME=VALUE` contract here means the reader
+/// (the server) and the writers (the dialers) never drift.
+pub fn ws_url_with_version(url: &str) -> String {
+    let sep = if url.contains('?') { '&' } else { '?' };
+    alloc::format!("{url}{sep}{VERSION_PARAM}={PROTOCOL_VERSION}")
+}
+
+/// Major-version component of a `"MAJOR.MINOR"` protocol string, or `None` if it
+/// is empty or not in that shape.
+fn protocol_major(version: &str) -> Option<&str> {
+    match version.split('.').next() {
+        Some(major) if !major.is_empty() => Some(major),
+        _ => None,
+    }
+}
+
+/// Whether a peer advertising `their_version` is wire-compatible with this
+/// crate's [`PROTOCOL_VERSION`].
+///
+/// Compatibility is by **major** version — a breaking wire change bumps the
+/// major (2.x → 3.0), a compatible additive change bumps only the minor. A
+/// missing or malformed version string is treated as **incompatible** (fail
+/// closed): a peer that cannot state a version it speaks is exactly the legacy
+/// client this gate exists to turn away.
+pub fn version_compatible(their_version: &str) -> bool {
+    match (
+        protocol_major(their_version),
+        protocol_major(PROTOCOL_VERSION),
+    ) {
+        (Some(theirs), Some(ours)) => theirs == ours,
+        _ => false,
+    }
+}
+
+/// Client hello message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelloMessage {
+    /// Protocol version
+    pub version: String,
+
+    /// Client identification string
+    pub client: String,
+
+    /// Desired capabilities (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
+
+    /// Authentication token (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+}
+
+/// Server welcome message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WelcomeMessage {
+    /// Protocol version
+    pub version: String,
+
+    /// Server identification string
+    pub server: String,
+
+    /// Granted permissions
+    pub permissions: Vec<String>,
+
+    /// Records that allow writes (empty for read-only)
+    pub writable_records: Vec<String>,
+
+    /// Maximum subscriptions per connection (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_subscriptions: Option<usize>,
+
+    /// Whether client is authenticated
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticated: Option<bool>,
+
+    /// The instance's name, when one was given at startup (3.1)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_name: Option<String>,
+}
+
+/// Most bytes of post-link data one `instance.post_link` reply carries; the
+/// reply's `data` is twice as many hex digits.
+pub const POST_LINK_CHUNK_MAX: u32 = 1024;
+
+/// Upper bound on an `instance.info` reply, in bytes of JSON: a 4 KiB payload,
+/// a 128-byte name (JSON escaping at most 6× it), a 32-byte UID as hex and
+/// the fixed fields. Every reply fits the smallest AimX frame (serial, 8 KiB).
+pub const INSTANCE_INFO_REPLY_MAX: usize = 6 * 1024;
+
+/// Reply of `instance.info` (3.1): which build and which instance this is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstanceInfoReply {
+    /// Version of `aimdb-core` the instance runs.
+    pub aimdb_version: String,
+    /// Name and UID given at startup.
+    pub instance: InstanceIdentityReply,
+    /// The build-info section; `None` (`null`) when none is embedded.
+    pub build: Option<BuildReply>,
+}
+
+/// The `instance` part of [`InstanceInfoReply`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstanceIdentityReply {
+    /// Instance name.
+    pub name: Option<String>,
+    /// Instance UID as lowercase hex.
+    pub uid: Option<String>,
+}
+
+/// The `build` part of [`InstanceInfoReply`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BuildReply {
+    /// Section layout version.
+    pub format: u16,
+    /// The payload as embedded (schema 1 or later); readers ignore fields
+    /// they do not know.
+    pub info: JsonValue,
+    /// The post-link region's state; `None` (`null`) when the section has no
+    /// region. Its bytes are read with `instance.post_link`.
+    pub post_link: Option<PostLinkReply>,
+}
+
+/// State of the post-link region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PostLinkReply {
+    /// Not written yet.
+    Erased,
+    /// Written: `len` bytes.
+    Written {
+        /// Number of written bytes.
+        len: u32,
+    },
+    /// Neither erased nor a valid length prefix.
+    Malformed,
+}
+
+/// Reply of `instance.post_link` (3.1): one chunk of the written post-link
+/// bytes. Clients read from offset 0 until they hold `total` bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostLinkChunk {
+    /// Offset of `data` in the written bytes, as requested.
+    pub offset: u32,
+    /// Number of written bytes.
+    pub total: u32,
+    /// Lowercase hex of at most [`POST_LINK_CHUNK_MAX`] bytes; empty at or
+    /// past the end.
+    pub data: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::ToString;
+    use alloc::vec;
+
+    #[test]
+    fn test_hello_serialization() {
+        let hello = HelloMessage {
+            version: PROTOCOL_VERSION.to_string(),
+            client: "test-client".to_string(),
+            capabilities: Some(vec!["read".to_string()]),
+            auth_token: None,
+        };
+
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(json.contains("\"version\":\"4.0\""));
+        assert!(json.contains("\"client\":\"test-client\""));
+    }
+
+    fn welcome(instance_name: Option<&str>) -> WelcomeMessage {
+        WelcomeMessage {
+            version: PROTOCOL_VERSION.to_string(),
+            server: "aimdb".to_string(),
+            permissions: vec!["read".to_string()],
+            writable_records: vec![],
+            max_subscriptions: Some(8),
+            authenticated: Some(false),
+            instance_name: instance_name.map(String::from),
+        }
+    }
+
+    #[test]
+    fn instance_name_is_omitted_when_unset() {
+        let json = serde_json::to_string(&welcome(None)).unwrap();
+        assert!(!json.contains("instance_name"), "{json}");
+        let json = serde_json::to_string(&welcome(Some("gateway-3"))).unwrap();
+        assert!(json.contains(r#""instance_name":"gateway-3""#), "{json}");
+    }
+
+    /// 3.1 is additive: a 3.0 client parses a 3.1 welcome, and a 3.1 client
+    /// parses a 3.0 welcome.
+    #[test]
+    fn welcome_is_compatible_both_ways() {
+        /// `WelcomeMessage` as of protocol 3.0, frozen.
+        #[derive(Deserialize, Serialize)]
+        struct WelcomeV30 {
+            version: String,
+            server: String,
+            permissions: Vec<String>,
+            writable_records: Vec<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_subscriptions: Option<usize>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            authenticated: Option<bool>,
+        }
+
+        let v31 = serde_json::to_string(&welcome(Some("gateway-3"))).unwrap();
+        let old: WelcomeV30 = serde_json::from_str(&v31).unwrap();
+        assert_eq!(old.server, "aimdb");
+
+        let v30 = serde_json::to_string(&WelcomeV30 {
+            version: "3.0".to_string(),
+            ..old
+        })
+        .unwrap();
+        let new: WelcomeMessage = serde_json::from_str(&v30).unwrap();
+        assert_eq!(new.instance_name, None);
+    }
+
+    #[test]
+    fn post_link_reply_shapes() {
+        let cases = [
+            (PostLinkReply::Erased, r#"{"state":"erased"}"#),
+            (
+                PostLinkReply::Written { len: 1472 },
+                r#"{"state":"written","len":1472}"#,
+            ),
+            (PostLinkReply::Malformed, r#"{"state":"malformed"}"#),
+        ];
+        for (reply, json) in cases {
+            assert_eq!(serde_json::to_string(&reply).unwrap(), json);
+            assert_eq!(serde_json::from_str::<PostLinkReply>(json).unwrap(), reply);
+        }
+    }
+
+    #[test]
+    fn version_compatible_matches_on_major() {
+        // Same major (current + a hypothetical future minor) → compatible.
+        assert!(version_compatible(PROTOCOL_VERSION));
+        assert!(version_compatible("4.0"));
+        assert!(version_compatible("4.7"));
+        assert!(version_compatible("4")); // bare major
+
+        // Older majors → refused: 3.x has no write stamps (`ts`), 2.x is the
+        // legacy WS-era wire.
+        assert!(!version_compatible("3.1"));
+        assert!(!version_compatible("3.0"));
+        assert!(!version_compatible("2.0"));
+        assert!(!version_compatible("1.0"));
+
+        // Missing / malformed → fail closed.
+        assert!(!version_compatible(""));
+        assert!(!version_compatible(".0"));
+        assert!(!version_compatible("garbage"));
+    }
+}

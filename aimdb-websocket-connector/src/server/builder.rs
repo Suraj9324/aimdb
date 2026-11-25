@@ -1,0 +1,365 @@
+//! Builder for the WebSocket connector.
+//!
+//! [`WebSocketConnectorBuilder`] implements [`ConnectorBuilder<R>`] from
+//! `aimdb-core`, following the same pattern as `MqttConnectorBuilder`.
+//!
+//! # Lifecycle
+//!
+//! ```text
+//! AimDbBuilder::build()
+//!   └─ WebSocketConnectorBuilder::build(&db)
+//!        ├─ InboundDispatch (client writes → producers, via the session Dispatch)
+//!        ├─ OutboundRoutes (records → broadcast bus, one broadcast loop)
+//!        ├─ start Axum / WebSocket server (per-connection `run_session`)
+//!        └─ return the server and broadcast-loop futures
+//! ```
+
+use std::{
+    net::{SocketAddr, ToSocketAddrs},
+    pin::Pin,
+    sync::Arc,
+    time::Instant,
+};
+
+use aimdb_data_contracts::Streamable;
+
+use aimdb_core::{
+    ConnectorBuilder, Dispatch, ExactGrammar, InboundDispatch, OutboundLatest, OutboundRoutes,
+};
+use axum::Router as AxumRouter;
+
+use super::{
+    auth::{AuthHandler, DynAuthHandler, NoAuth},
+    client_manager::ClientManager,
+    dispatch::WsDispatch,
+    http::{build_server_future, ServerState},
+    registry::StreamableRegistry,
+};
+
+// ════════════════════════════════════════════════════════════════════
+// Builder
+// ════════════════════════════════════════════════════════════════════
+
+/// Builder for the AimDB WebSocket connector.
+///
+/// # Example
+///
+/// ```no_run
+/// use aimdb_websocket_connector::WebSocketConnector;
+/// # use aimdb_data_contracts::{SchemaType, Streamable};
+/// # #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// # struct Temperature { celsius: f32 }
+/// # impl SchemaType for Temperature { const NAME: &'static str = "temperature"; }
+/// # impl Streamable for Temperature {}
+///
+/// let mut connector = WebSocketConnector::new();
+/// connector.register::<Temperature>();
+///
+/// let connector = connector
+///     .bind("0.0.0.0:8080")
+///     .path("/ws")
+///     .with_late_join(true)
+///     .with_max_clients(500)
+///     .with_max_subs_per_connection(500);
+/// ```
+pub struct WebSocketConnectorBuilder {
+    bind_addr: SocketAddr,
+    ws_path: String,
+    auth: DynAuthHandler,
+    late_join: bool,
+    max_clients: usize,
+    max_subs_per_connection: usize,
+    channel_capacity: usize,
+    additional_routes: Option<AxumRouter>,
+    /// Topics to subscribe every new client to automatically on connect.
+    ///
+    /// When non-empty, clients receive data on these topics immediately after
+    /// the WebSocket handshake without having to send a subscribe frame.
+    /// Use `["#"]` to push all topics to every client.
+    auto_subscribe_topics: Vec<String>,
+    /// Registered streamable types for schema resolution.
+    streamable_registry: StreamableRegistry,
+}
+
+impl Default for WebSocketConnectorBuilder {
+    fn default() -> Self {
+        Self {
+            bind_addr: "0.0.0.0:8080".parse().unwrap(),
+            ws_path: "/ws".to_string(),
+            auth: Arc::new(NoAuth),
+            late_join: true,
+            max_clients: 1024,
+            max_subs_per_connection: 1024,
+            channel_capacity: 256,
+            additional_routes: None,
+            auto_subscribe_topics: Vec::new(),
+            streamable_registry: StreamableRegistry::new(),
+        }
+    }
+}
+
+impl WebSocketConnectorBuilder {
+    /// Create a new builder with sensible defaults.
+    ///
+    /// Defaults:
+    /// - bind address: `0.0.0.0:8080`
+    /// - WebSocket path: `/ws`
+    /// - auth: allow all
+    /// - late-join snapshots: enabled
+    /// - max clients: 1 024
+    /// - max subscriptions per connection: 1 024
+    /// - per-client channel capacity: 256
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the TCP address to bind the WebSocket server to.
+    pub fn bind(mut self, addr: impl ToSocketAddrs) -> Self {
+        self.bind_addr = addr
+            .to_socket_addrs()
+            .expect("invalid bind address")
+            .next()
+            .expect("bind address resolved to no addresses");
+        self
+    }
+
+    /// Set the URL path for the WebSocket upgrade endpoint (default: `"/ws"`).
+    pub fn path(mut self, path: impl Into<String>) -> Self {
+        self.ws_path = path.into();
+        self
+    }
+
+    /// Use JSON encoding (currently the only supported encoding, this is the
+    /// default and is provided for explicitness).
+    pub fn with_json_encoding(self) -> Self {
+        self
+    }
+
+    /// Plug in a custom authentication / authorization handler.
+    pub fn with_auth(mut self, handler: impl AuthHandler + 'static) -> Self {
+        self.auth = Arc::new(handler);
+        self
+    }
+
+    /// Enable or disable late-join snapshots (default: `true`).
+    ///
+    /// When enabled, a client that subscribes receives a `snap` frame for each
+    /// matching `ws://` link before live events start. The snapshot is the
+    /// record's current value, serialized by the link, on the topic that value
+    /// produces. A record without a current value (nothing written yet, or an
+    /// `SpmcRing` buffer) sends none.
+    pub fn with_late_join(mut self, enabled: bool) -> Self {
+        self.late_join = enabled;
+        self
+    }
+
+    /// Set the live-connection ceiling (default: 1 024).
+    ///
+    /// Enforced at the HTTP upgrade: once this many clients are connected,
+    /// further upgrades are refused with `503 Service Unavailable` before the
+    /// socket opens. A slot is claimed when the upgrade is admitted and released
+    /// when that connection's session ends.
+    ///
+    /// Note that a connection lost *without* a TCP FIN — a cut cable, a NAT or
+    /// firewall silently dropping the flow — holds its slot until the socket is
+    /// noticed as dead, since the server neither pings nor times out idle
+    /// connections. Size the cap with that in mind.
+    ///
+    /// This method previously set the per-connection subscription cap; that knob
+    /// is now [`with_max_subs_per_connection`](Self::with_max_subs_per_connection).
+    pub fn with_max_clients(mut self, max: usize) -> Self {
+        self.max_clients = max;
+        self
+    }
+
+    /// Set the per-connection subscription ceiling (default: 1 024).
+    pub fn with_max_subs_per_connection(mut self, max: usize) -> Self {
+        self.max_subs_per_connection = max;
+        self
+    }
+
+    /// Set the per-client send-buffer capacity in messages (default: 256).
+    ///
+    /// If the buffer fills up (slow client), messages are silently dropped via
+    /// `try_send`.
+    pub fn with_channel_capacity(mut self, cap: usize) -> Self {
+        self.channel_capacity = cap;
+        self
+    }
+
+    /// Mount additional Axum routes (e.g., REST endpoints) on the same server.
+    ///
+    /// The extra routes are merged into the connector's Axum application so that
+    /// REST and WebSocket traffic can share a single port.
+    /// Handlers can extract `axum::Extension<aimdb_core::AimDb>` to read the
+    /// database. Existing application state supplied with `with_state` is preserved.
+    ///
+    /// Additional routes are **not** protected by the connector's `AuthHandler`.
+    /// Apply authentication middleware to the supplied router when needed.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use aimdb_core::AimDb;
+    /// use axum::{routing::get, Extension, Router, http::StatusCode};
+    /// # use aimdb_websocket_connector::WebSocketConnector;
+    ///
+    /// async fn temperature(Extension(db): Extension<AimDb>) -> Result<String, StatusCode> {
+    ///     db.latest(aimdb_core::Name::<f32>::new("temperature"))
+    ///         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    ///         .map(|sample| format!("{:.1}", sample.value))
+    ///         .ok_or(StatusCode::SERVICE_UNAVAILABLE)
+    /// }
+    /// let rest = Router::new().route("/temperature", get(temperature));
+    /// let connector = WebSocketConnector::new().with_additional_routes(rest);
+    /// ```
+    pub fn with_additional_routes(mut self, router: AxumRouter) -> Self {
+        self.additional_routes = Some(router);
+        self
+    }
+
+    /// Subscribe every new client to these topic patterns immediately on connect.
+    ///
+    /// Clients will begin receiving data on matching topics right after the
+    /// WebSocket handshake without needing to send a `Subscribe` message.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use aimdb_websocket_connector::WebSocketConnector;
+    /// WebSocketConnector::new()
+    ///     .with_auto_subscribe(["sensors.#"]); // or ["#"] to push everything
+    /// ```
+    pub fn with_auto_subscribe(
+        mut self,
+        topics: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.auto_subscribe_topics = topics.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Register a [`Streamable`] type for WebSocket schema resolution.
+    ///
+    /// Each call monomorphizes closures that capture `T` for serialization,
+    /// deserialization, and routing. The serializer performs a `downcast_ref`
+    /// on `&dyn Any` to recover the concrete type at dispatch.
+    /// # Panics
+    ///
+    /// Panics if a *different* type has already been registered under the
+    /// same schema name (`T::NAME`).
+    pub fn register<T: Streamable>(&mut self) -> &mut Self {
+        self.streamable_registry
+            .register::<T>()
+            .expect("schema name collision in StreamableRegistry");
+        self
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// ConnectorBuilder impl
+// ════════════════════════════════════════════════════════════════════
+
+type BoxFuture = Pin<Box<dyn core::future::Future<Output = ()> + Send + 'static>>;
+
+impl ConnectorBuilder for WebSocketConnectorBuilder {
+    fn scheme(&self) -> &str {
+        "ws"
+    }
+
+    fn build<'a>(
+        &'a self,
+        db: &'a aimdb_core::builder::AimDb,
+    ) -> Pin<Box<dyn core::future::Future<Output = aimdb_core::DbResult<Vec<BoxFuture>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // ── Inbound routes ──────────────────────────────────────
+            let inbound = InboundDispatch::new(db, "ws", &ExactGrammar)?;
+
+            aimdb_core::log_info!(
+                "WS connector: {} inbound routes collected",
+                inbound.route_count()
+            );
+
+            // ── Outbound routes ─────────────────────────────────────
+            // Every route carries its record's index, which the broadcast
+            // bus checks client permissions against.
+            let outbound = OutboundRoutes::new(db, "ws")?;
+
+            // AimX frames splice each payload in as JSON: an inline envelope
+            // header would produce invalid messages, and could never arrive.
+            aimdb_core::session::refuse_inline_envelopes("ws", &outbound, &inbound)?;
+
+            // ── Client manager ────────────────────────────────────
+            let client_mgr = ClientManager::new(self.channel_capacity.max(1));
+
+            // ── Late-join snapshots: each link's current value ───
+            let latest = OutboundLatest::new(db, "ws");
+
+            // ── Schema names for record.list enrichment ───────────
+            // Core builds each `record.list` row but can't map a `TypeId` to a
+            // data-contract schema name; the connector's registry can, so hand
+            // the dispatch the name lookup to stamp onto core's rows.
+            let schema_by_type = Arc::new(self.streamable_registry.schema_by_type_id());
+
+            // List of record key from inner db, order maintained as registration order
+            // This list is immutable after this `build` completed
+            let records: Arc<Vec<String>> = Arc::new(
+                db.list_records()
+                    .iter()
+                    .map(|m| m.record_key.clone())
+                    .collect(),
+            );
+
+            // ── Shared dispatch (one Arc<dyn Dispatch> per server) ───
+            let dispatch: Arc<dyn Dispatch> = Arc::new(WsDispatch {
+                db: db.clone(),
+                client_mgr: client_mgr.clone(),
+                latest,
+                inbound,
+                schema_by_type,
+                auth: self.auth.clone(),
+                late_join: self.late_join,
+            });
+
+            // ── Outbound: one broadcast loop pulls records → bus ────
+            let broadcast = run_broadcast(outbound, client_mgr.clone());
+
+            // ── Build Axum server future ──────────────────────────
+            let state = ServerState {
+                dispatch,
+                auth: self.auth.clone(),
+                client_mgr,
+                auto_subscribe: Arc::new(self.auto_subscribe_topics.clone()),
+                max_clients: self.max_clients.max(1),
+                max_subs_per_connection: self.max_subs_per_connection.max(1),
+                started_at: Instant::now(),
+                records,
+            };
+            let additional = self
+                .additional_routes
+                .clone()
+                .map(|router| router.layer(axum::Extension(db.clone())));
+            let server_future =
+                build_server_future(self.bind_addr, self.ws_path.clone(), state, additional);
+
+            let futures: Vec<BoxFuture> = vec![server_future, Box::pin(broadcast)];
+            Ok(futures)
+        })
+    }
+}
+
+/// Pull every outbound record update and fan it out to subscribed clients.
+///
+/// The bus carries raw record-value bytes tagged with the topic, the
+/// record's index and the value's write stamp; each connection's AimX codec
+/// applies the `event` envelope (with `ts`) downstream. Returns once every
+/// outbound route has closed.
+async fn run_broadcast(mut outbound: OutboundRoutes, client_mgr: ClientManager) {
+    while let Some(msg) = outbound.next().await {
+        let index = msg.route.record_index;
+        let ts = msg.stamp();
+        client_mgr
+            .broadcast(msg.topic, index, msg.payload.as_slice(), ts)
+            .await;
+    }
+}

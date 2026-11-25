@@ -1,0 +1,289 @@
+//! Configuration types for AimX remote access
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use hashbrown::HashSet;
+
+use crate::record_id::StringKey;
+
+/// Configuration for AimX remote access
+///
+/// Defines how the remote access layer behaves, including socket path,
+/// security policy and connection / subscription limits.
+#[derive(Debug, Clone)]
+pub struct AimxConfig {
+    /// Path to Unix domain socket
+    pub socket_path: String,
+
+    /// Security policy (read-only or read-write)
+    pub security_policy: SecurityPolicy,
+
+    /// Maximum number of concurrent client connections accepted by the
+    /// supervisor. When the in-flight connection count reaches this
+    /// value, newly-accepted Unix sockets are closed immediately (the
+    /// client sees a closed socket on connect).
+    pub max_connections: usize,
+
+    /// Maximum number of concurrent subscriptions allowed per connection.
+    /// Once a connection holds this many subscriptions, further
+    /// `record.subscribe` calls receive a `too_many_subscriptions` error
+    /// until one is released via `record.unsubscribe`.
+    pub max_subs_per_connection: usize,
+
+    /// Optional authentication token
+    pub auth_token: Option<String>,
+
+    /// File permissions for the socket (Unix only)
+    /// Format: octal mode (e.g., 0o600 for owner-only)
+    pub socket_permissions: Option<u32>,
+}
+
+impl AimxConfig {
+    /// Creates a default UDS configuration
+    ///
+    /// # Defaults
+    /// - Socket path: `/tmp/aimdb.sock`
+    /// - Security policy: Read-only
+    /// - Max connections: 16
+    /// - Max subscriptions per connection: 32
+    /// - No auth token
+    /// - Socket permissions: 0o600 (owner-only)
+    pub fn uds_default() -> Self {
+        Self {
+            socket_path: String::from("/tmp/aimdb.sock"),
+            security_policy: SecurityPolicy::ReadOnly,
+            max_connections: 16,
+            max_subs_per_connection: 32,
+            auth_token: None,
+            socket_permissions: Some(0o600),
+        }
+    }
+
+    /// Sets the socket path
+    pub fn socket_path(mut self, path: impl Into<String>) -> Self {
+        self.socket_path = path.into();
+        self
+    }
+
+    /// Sets the security policy
+    pub fn security_policy(mut self, policy: SecurityPolicy) -> Self {
+        self.security_policy = policy;
+        self
+    }
+
+    /// Sets the maximum number of concurrent connections
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = max;
+        self
+    }
+
+    /// Sets the maximum number of concurrent subscriptions per connection
+    pub fn max_subs_per_connection(mut self, max: usize) -> Self {
+        self.max_subs_per_connection = max;
+        self
+    }
+
+    /// Sets an authentication token
+    pub fn auth_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
+    /// Sets the socket file permissions (Unix only)
+    ///
+    /// # Example
+    /// ```rust
+    /// # use aimdb_core::remote::AimxConfig;
+    /// let config = AimxConfig::uds_default()
+    ///     .socket_permissions(0o600); // Owner only (0o660: owner + group)
+    /// ```
+    pub fn socket_permissions(mut self, mode: u32) -> Self {
+        self.socket_permissions = Some(mode);
+        self
+    }
+}
+
+/// Security policy for remote access
+///
+/// Defines which operations are permitted and for which records.
+#[derive(Debug, Clone)]
+pub enum SecurityPolicy {
+    /// Read-only access (list, get, subscribe)
+    ///
+    /// This is the default and recommended policy for most deployments.
+    /// No write operations are permitted.
+    ReadOnly,
+
+    /// Read-write access with explicit per-record opt-in
+    ///
+    /// Write operations (`record.set`) are only allowed for records
+    /// whose RecordKey is in the `writable_records` set.
+    ReadWrite {
+        /// Set of RecordKeys that allow write operations
+        writable_records: HashSet<String>,
+    },
+}
+
+impl SecurityPolicy {
+    /// Creates a read-only policy
+    pub fn read_only() -> Self {
+        Self::ReadOnly
+    }
+
+    /// Creates a read-write policy with no writable records initially
+    pub fn read_write() -> Self {
+        Self::ReadWrite {
+            writable_records: HashSet::new(),
+        }
+    }
+
+    /// Adds a record key to the writable set
+    ///
+    /// Only has effect for ReadWrite policies. Panics if policy is ReadOnly.
+    #[allow(
+        clippy::panic,
+        reason = "documented API contract; a Result instead is a breaking change"
+    )]
+    pub fn allow_write_key(&mut self, key: impl Into<String>) {
+        match self {
+            Self::ReadWrite { writable_records } => {
+                writable_records.insert(key.into());
+            }
+            Self::ReadOnly => {
+                panic!("Cannot allow writes in ReadOnly security policy");
+            }
+        }
+    }
+
+    /// Adds a record key to the writable set (builder pattern)
+    ///
+    /// # Panics
+    /// Panics if called on a ReadOnly policy
+    #[allow(
+        clippy::panic,
+        reason = "documented API contract; a Result instead is a breaking change"
+    )]
+    pub fn with_writable_key(mut self, key: impl Into<String>) -> Self {
+        match self {
+            Self::ReadWrite {
+                ref mut writable_records,
+            } => {
+                writable_records.insert(key.into());
+                self
+            }
+            Self::ReadOnly => {
+                panic!("Cannot allow writes in ReadOnly security policy");
+            }
+        }
+    }
+
+    /// Checks if a record key is writable
+    pub fn is_writable_key(&self, key: &str) -> bool {
+        match self {
+            Self::ReadOnly => false,
+            Self::ReadWrite { writable_records } => writable_records.contains(key),
+        }
+    }
+
+    /// Returns the list of granted permissions
+    pub fn permissions(&self) -> &[&str] {
+        match self {
+            Self::ReadOnly => &["read", "subscribe"],
+            Self::ReadWrite { .. } => &["read", "subscribe", "write"],
+        }
+    }
+
+    /// Returns the list of writable record keys (for ReadWrite policy)
+    pub fn writable_records(&self) -> Vec<String> {
+        match self {
+            Self::ReadOnly => Vec::new(),
+            Self::ReadWrite { writable_records } => writable_records.iter().cloned().collect(),
+        }
+    }
+
+    /// Returns the list of writable record keys as StringKeys
+    pub fn writable_record_keys(&self) -> Vec<StringKey> {
+        match self {
+            Self::ReadOnly => Vec::new(),
+            Self::ReadWrite { writable_records } => writable_records
+                .iter()
+                .map(|s| StringKey::from_dynamic(s.as_str()))
+                .collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_default_config() {
+        let config = AimxConfig::uds_default();
+        assert_eq!(config.socket_path, "/tmp/aimdb.sock");
+        assert_eq!(config.max_connections, 16);
+        assert_eq!(config.max_subs_per_connection, 32);
+        assert!(matches!(config.security_policy, SecurityPolicy::ReadOnly));
+        assert!(config.auth_token.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_config_builder() {
+        let config = AimxConfig::uds_default()
+            .socket_path("/var/run/aimdb.sock")
+            .max_connections(32)
+            .max_subs_per_connection(8)
+            .auth_token("secret-token")
+            .socket_permissions(0o660);
+
+        assert_eq!(config.socket_path, "/var/run/aimdb.sock");
+        assert_eq!(config.max_connections, 32);
+        assert_eq!(config.max_subs_per_connection, 8);
+        assert_eq!(config.auth_token, Some("secret-token".to_string()));
+        assert_eq!(config.socket_permissions, Some(0o660));
+    }
+
+    #[test]
+    fn test_security_policy_read_only() {
+        let policy = SecurityPolicy::read_only();
+        assert!(!policy.is_writable_key("test.record"));
+        assert_eq!(policy.permissions(), &["read", "subscribe"]);
+    }
+
+    #[test]
+    fn test_security_policy_read_write() {
+        let mut policy = SecurityPolicy::read_write();
+        assert!(!policy.is_writable_key("test.record"));
+
+        policy.allow_write_key("test.record");
+        assert!(policy.is_writable_key("test.record"));
+        assert!(!policy.is_writable_key("other.record"));
+        assert_eq!(policy.permissions(), &["read", "subscribe", "write"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot allow writes in ReadOnly security policy")]
+    fn test_security_policy_read_only_panic() {
+        let mut policy = SecurityPolicy::read_only();
+        policy.allow_write_key("test.record");
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot allow writes in ReadOnly security policy")]
+    fn test_security_policy_read_only_builder_panic() {
+        let _policy = SecurityPolicy::read_only().with_writable_key("test.record");
+    }
+
+    #[test]
+    fn test_security_policy_builder() {
+        let policy = SecurityPolicy::read_write()
+            .with_writable_key("sensor.temperature")
+            .with_writable_key("config.app");
+
+        assert!(policy.is_writable_key("sensor.temperature"));
+        assert!(policy.is_writable_key("config.app"));
+        assert!(!policy.is_writable_key("other.record"));
+    }
+}

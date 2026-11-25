@@ -1,0 +1,88 @@
+[package]
+name = "aimdb-tokio-adapter"
+version = "0.8.0"
+edition = "2021"
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Tokio runtime adapter for AimDB - full-featured std async runtime support"
+keywords = ["tokio", "async", "runtime", "adapter", "database"]
+categories = ["asynchronous", "database-implementations"]
+
+[features]
+default = ["std", "tokio-runtime"]
+
+# Platform features
+std = ["aimdb-core/std"]
+
+# Runtime features
+tokio-runtime = ["tokio", "tokio-util", "std"]
+
+# Tokio sockets, dialers, listeners, datagrams and clock behind core's
+# runtime-neutral I/O traits, so connector crates need no tokio dependency.
+net = ["tokio-runtime", "aimdb-core/connector-session", "tokio/net", "tokio/io-util"]
+
+# `embedded_io_async::{Read, Write, ReadReady}` on the `net` streams, so a
+# protocol client written against those traits (mountain-mqtt, embedded-tls)
+# runs on a host over `TokioNet::tcp()`.
+embedded-io = ["net", "dep:embedded-io-async"]
+
+# The facade's two destinations. Required, not cosmetic: the `log_*` macros
+# expand in this crate (`events.rs`), so each arm is selected by *this*
+# crate's features and `aimdb-core/{tracing,log}` alone would leave these call
+# sites unrouted.
+tracing = ["aimdb-core/tracing"]
+log = ["aimdb-core/log"]
+
+# Observability features
+observability = ["aimdb-core/observability", "tokio-runtime"]
+
+# Testing features
+test-utils = ["aimdb-core/test-utils", "tokio-runtime"]
+
+[dependencies]
+# Core AimDB types - std version for Tokio (for DbError integration)
+aimdb-core = { version = "3.0.0", path = "../aimdb-core", default-features = false, features = [
+    "std",
+] }
+
+# Tokio async runtime
+tokio = { workspace = true, optional = true, features = [
+    "time",
+    "rt-multi-thread",
+    "sync",            # For broadcast, watch, Mutex
+] }
+
+# ReusableBoxFuture for the broadcast/watch readers' poll_recv (design 037 / W8):
+# one heap box per subscriber lifetime, reused for every message — zero
+# per-message allocation. broadcast/watch expose no public poll API, so the
+# reader round-trips the receiver through a stored, reused future.
+tokio-util = { version = "0.7", optional = true, default-features = false }
+
+# `std` supplies `From<std::io::ErrorKind>`, so Tokio's error detail survives
+# instead of collapsing to `Other`.
+embedded-io-async = { workspace = true, optional = true, features = ["std"] }
+
+# `RuntimeOps::log` forwards to the `log` facade; the binary picks the backend.
+log = "0.4"
+
+[dev-dependencies]
+# For async testing
+tokio-test = { workspace = true }
+# `test-util` for paused time (`start_paused`) in the clock tests.
+tokio = { workspace = true, features = ["test-util", "macros"] }
+futures = { workspace = true }
+
+# For drain integration tests
+aimdb-client = { path = "../aimdb-client" }
+# Stands up the AimX UDS server (`UdsServer`) the drain tests connect to.
+aimdb-uds-connector = { path = "../aimdb-uds-connector" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# `aimdb-core`'s log macros carry a `#[cfg(feature = "defmt")]` arm that
+# expands here; this crate never builds with defmt, so it only names it.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("defmt"))'] }

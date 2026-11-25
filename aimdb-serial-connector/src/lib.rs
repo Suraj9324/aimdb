@@ -1,0 +1,85 @@
+//! COBS-framed serial/UART transport connector for AimDB — record mirroring and
+//! remote access over a serial line.
+//!
+//! A thin, swappable transport crate (the serial sibling of `aimdb-uds-connector`):
+//! it contributes only the COBS framing plus thin sugar; the AimX codec
+//! (`AimxCodec`), dispatch (`AimxDispatch`), `Connection` itself
+//! (`FramedConnection`), and the runtime-neutral session engines are reused
+//! verbatim from `aimdb-core`.
+//!
+//! Core's session items are named unlinked throughout these docs: they exist
+//! only when the `connector` feature pulls in `aimdb-core/connector-session`,
+//! and a link to them fails `cargo doc` on a build without it. The same goes for
+//! anything gated on `std`.
+//!
+//! The wire is the same compact AimX JSON as UDS, but framed with **COBS**
+//! (Consistent Overhead Byte Stuffing) and a `0x00` delimiter instead of a
+//! newline — self-synchronizing on a lossy/unframed serial medium. See
+//! [`framing`].
+//!
+//! One path for both runtimes: the byte source comes from an adapter
+//! (`EmbassyUart` on the MCU, `TokioByteStream` over a `SerialStream` on the
+//! host) and this crate contributes only the COBS framer. A UART is
+//! point-to-point, so the stream is moved in and served once.
+//!
+//! # Sessions on a line that never closes
+//!
+//! A UART has no connect or disconnect: the server serves one connection for
+//! the firmware's lifetime and cannot see a client leave. A client's `hello`
+//! is what marks a new one: the session engine then ends the previous
+//! client's session (its subscriptions stop and release their buffer slots)
+//! and answers the new client from a fresh one. So every client that connects
+//! gets its events, however often clients come and go.
+//!
+//! Every client sends one: `SerialClient` opens each connection with a
+//! `hello`, ahead of its subscriptions and writes, and `aimdb-client` sends
+//! one when it connects. `SerialClient` does not wait for the reply — the
+//! line keeps byte order, so the server reads the `hello` first — and does
+//! not resend a `hello` lost on the line: the client then stays in the old
+//! session until it reconnects.
+//!
+//! Until the next `hello`, a client that left keeps its subscriptions: they
+//! go on streaming into the UART and hold their buffer slots. Size the
+//! subscriber slots of a record with remote access for the subscribers a
+//! client opens (one per record it watches) on top of the record's own taps
+//! and links.
+//!
+//! Both speak the `serial://` scheme by default ([`DEFAULT_SCHEME`]).
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+// The COBS codec, and — under `connector` — that codec behind core's `Framer`.
+pub mod framing;
+
+// Runtime-neutral `SerialClient`/`SerialServer` over an adapter's byte stream.
+#[cfg(feature = "connector")]
+pub mod connector;
+
+/// The default scheme `SerialClient`/`SerialServer` register when none is given.
+///
+/// Transport-matched (like UDS's `"uds"`), so `link_to("serial://<record>")` reads
+/// at the call site. Override with `.scheme(...)` when running more than one
+/// remote connector.
+pub const DEFAULT_SCHEME: &str = "serial";
+
+/// Mark each record named in the policy's writable set as writable, so
+/// `record.list` advertises the `writable` flag (the dispatch also enforces it).
+/// Shared by both `SerialServer` halves; mirrors the UDS connector.
+#[cfg(feature = "connector")]
+pub(crate) fn apply_writable(db: &aimdb_core::AimDb, config: &aimdb_core::remote::AimxConfig) {
+    for key in config.security_policy.writable_records() {
+        if let Some(id) = db.inner().resolve_str(&key) {
+            if let Some(storage) = db.inner().storage(id) {
+                storage.set_writable_erased(true);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "connector")]
+pub use connector::{framed, SerialClient, SerialServer};
+
+#[cfg(feature = "std")]
+pub use connector::SerialPortDialer;

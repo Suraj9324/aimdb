@@ -1,0 +1,407 @@
+//! Shared per-topic broadcast bus.
+//!
+//! [`ClientManager`] is the **fan-out bridge** behind `Dispatch::subscribe`: one
+//! record update reaches every matching subscription. Each `WsSession::subscribe`
+//! registers a per-subscription channel and gets back a [`BoxStream`] of
+//! topic-tagged [`SubUpdate`]s; the engine envelopes each into an AimX `event`
+//! frame per connection (the payload bytes stay `Arc`-shared — only the small
+//! envelope is per-subscriber). The builder's outbound broadcast loop feeds
+//! [`broadcast`](ClientManager::broadcast).
+//!
+//! Frame formatting lives in the codec; the per-connection send half is owned by
+//! `run_session`.
+
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
+use aimdb_core::{topic_matches, BoxStream, Payload, SubUpdate};
+use dashmap::DashMap;
+use tokio::sync::mpsc;
+
+use crate::server::auth::RecordsBits;
+
+use super::auth::ClientId;
+
+/// One live subscription: a wildcard pattern + the channel feeding its stream.
+struct SubEntry {
+    pattern: String,
+    /// Bounded; `broadcast` drops on a full channel (slow-client protection).
+    tx: mpsc::Sender<SubUpdate>,
+    /// Updates dropped (full channel) since the last one that got through, to be
+    /// folded into the next delivered [`SubUpdate::skipped`] so a broadcast-stage
+    /// drop still surfaces as a `seq` gap downstream — the same loss signal the
+    /// per-record buffer lag and the connection funnel already emit. Without
+    /// this, a drop *here* (upstream of where the pump assigns `seq`) would be
+    /// silent, and a slow fan-out consumer would under-report its loss.
+    dropped: AtomicU64,
+
+    /// A bit mask encodes what record that the client could read from.
+    /// `SubEntry` is created when a client subscribes to a topic, so it ultimately
+    /// could carry a bit of `ClientInfo`
+    record_perms: Arc<RecordsBits>,
+}
+
+/// Drop guard for SubEntry
+struct SubEntryGuard {
+    id: u64,
+    subs: Arc<DashMap<u64, SubEntry>>,
+}
+
+/// The Drop takes the write lock inside the subs DashMap.
+/// So must not drop this guard while the same thread is holding
+/// any ref into `subs` - `iter()`/`Ref` guard.
+/// This would lead to self-deadlock in the same thread
+/// Correct implementation: `ClientManager::broadcast` defers its removals
+/// until after the iteration.
+impl Drop for SubEntryGuard {
+    fn drop(&mut self) {
+        self.subs.remove(&self.id);
+    }
+}
+
+/// Shared per-topic broadcast bus. Cloning is cheap (all clones share state).
+#[derive(Clone)]
+pub struct ClientManager {
+    /// sub-id → subscription entry.
+    subs: Arc<DashMap<u64, SubEntry>>,
+    /// Allocator for subscription ids.
+    next_sub: Arc<AtomicU64>,
+    /// Allocator for client ids (assigned at the HTTP upgrade).
+    next_client: Arc<AtomicU64>,
+    /// Live connection count (for the health endpoint).
+    connections: Arc<AtomicU64>,
+    /// Per-subscription channel bound (the builder's `with_channel_capacity`).
+    sub_capacity: usize,
+}
+
+impl ClientManager {
+    /// Create a new, empty bus. `sub_capacity` bounds each subscription's queue.
+    pub fn new(sub_capacity: usize) -> Self {
+        Self {
+            subs: Arc::new(DashMap::new()),
+            next_sub: Arc::new(AtomicU64::new(1)),
+            next_client: Arc::new(AtomicU64::new(1)),
+            connections: Arc::new(AtomicU64::new(0)),
+            sub_capacity: sub_capacity.max(1),
+        }
+    }
+
+    /// Allocate a new unique [`ClientId`] (called at the HTTP upgrade).
+    pub fn next_client_id(&self) -> ClientId {
+        ClientId(self.next_client.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Number of live connections (informational, for `/health`).
+    pub fn client_count(&self) -> usize {
+        self.connections.load(Ordering::Relaxed) as usize
+    }
+
+    /// Claim a connection slot, or `None` once `max_clients` are live.
+    ///
+    /// The check and the increment are one compare-exchange, so concurrent
+    /// upgrades cannot all pass on the same observed count — hence the retry
+    /// loop, which re-reads the value another thread just claimed. The returned
+    /// guard releases the slot on drop, so it must be held for as long as the
+    /// connection lives (see `ws_upgrade_handler`).
+    pub(crate) fn try_connection_guard(&self, max_clients: u64) -> Option<ConnectionGuard> {
+        let mut current = self.connections.load(Ordering::Relaxed);
+        // Try to claim the slot till success
+        loop {
+            if current >= max_clients {
+                return None;
+            }
+
+            match self.connections.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(ConnectionGuard {
+                        connections: self.connections.clone(),
+                    })
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Register a subscription for `pattern`; returns its id and a Stream-bound object
+    /// of topic-tagged record-value updates.
+    /// The stream, when dropped, having its associated entry dropped
+    /// through a guard that the stream owns.
+    /// The next matching [`broadcast`](Self::broadcast) keeps trying to lazily prune the entry.
+    /// This could serve as a safety net to make sure nothing leaks.
+    pub fn subscribe(
+        &self,
+        pattern: &str,
+        record_perms: Arc<RecordsBits>,
+    ) -> (u64, BoxStream<'static, SubUpdate>) {
+        let id = self.next_sub.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel::<SubUpdate>(self.sub_capacity);
+        self.subs.insert(
+            id,
+            SubEntry {
+                pattern: pattern.to_string(),
+                tx,
+                dropped: AtomicU64::new(0),
+                record_perms,
+            },
+        );
+        // A drop guard for RAII, thankfully self.subs is already Arc<_>
+        let guard = SubEntryGuard {
+            id,
+            subs: self.subs.clone(),
+        };
+        let stream = futures_util::stream::unfold((rx, guard), |(mut rx, guard)| async move {
+            rx.recv().await.map(|item| (item, (rx, guard)))
+        });
+        (id, Box::pin(stream))
+    }
+
+    /// Fan a serialized record-value out to every subscription whose pattern
+    /// matches `topic`. Dead subscriptions (dropped streams) are pruned.
+    ///
+    /// The payload and the topic tag are `Arc`-shared to every matching
+    /// subscription (refcount bumps, no per-subscriber copies); the per-frame
+    /// envelope is applied downstream by each connection's codec.
+    ///
+    /// A full channel drops the update (slow-client protection) but records it on
+    /// the subscription's `dropped` counter, folded into the next delivered
+    /// update's `skipped` so the loss still surfaces as a `seq` gap.
+    pub async fn broadcast(
+        &self,
+        topic: &str,
+        record_index: usize,
+        payload_bytes: &[u8],
+        ts: aimdb_core::Stamp,
+    ) {
+        // A record could comes with multiple topic, or none
+        // But a client may not have access to some records due to server's authorization process
+        // Broadcasting must check for allowed records of each client
+
+        let payload = Payload::from(payload_bytes);
+        let tag: Arc<str> = Arc::from(topic);
+        let mut dead: Vec<u64> = Vec::new();
+        for entry in self.subs.iter() {
+            if !topic_matches(&entry.pattern, topic) {
+                continue;
+            }
+
+            // Do not broadcast for non-authorized records
+            if !entry.record_perms.is_allowed(record_index) {
+                continue;
+            }
+
+            // Carry any drops accumulated since the last delivered update, so a
+            // broadcast-stage loss rides this update's `skipped` into a `seq`
+            // gap. Take them now; restore on failure so nothing is lost.
+            let carried = entry.dropped.swap(0, Ordering::Relaxed);
+            let update = SubUpdate::tagged(tag.clone(), payload.clone(), ts).with_skipped(carried);
+            // Bounded: drop on a full queue (slow-client protection), prune only
+            // when the receiver is gone (stream dropped).
+            match entry.tx.try_send(update) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // This update is dropped too: restore the carried count and
+                    // add one for it, to ride the next delivered update.
+                    entry.dropped.fetch_add(carried + 1, Ordering::Relaxed);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => dead.push(*entry.key()),
+            }
+        }
+
+        // Removals are deferred till here, avoiding holding read-lock
+        // while trying to acquire write-lock.
+        for id in dead {
+            self.subs.remove(&id);
+        }
+    }
+
+    /// Number of live subscriptions (for monitoring/tests).
+    pub fn subscription_count(&self) -> usize {
+        self.subs.len()
+    }
+}
+
+impl Default for ClientManager {
+    fn default() -> Self {
+        Self::new(256)
+    }
+}
+
+/// Decrements the connection count when dropped (held by `WsSession`).
+pub(crate) struct ConnectionGuard {
+    connections: Arc<AtomicU64>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    /// A simple record permissions that allow client to read record having index 0
+    fn simple_record_perms() -> Arc<RecordsBits> {
+        let mut record_pems = RecordsBits::new(1);
+        let _ = record_pems.set(0);
+        Arc::new(record_pems)
+    }
+
+    #[tokio::test]
+    async fn broadcast_reaches_matching_subscriptions() {
+        let mgr = ClientManager::new(256);
+        let record_perms = simple_record_perms();
+        let (_id, mut stream) = mgr.subscribe("sensors.#", record_perms);
+
+        mgr.broadcast(
+            "sensors.temp.vienna",
+            0,
+            b"22.5",
+            aimdb_core::Stamp::from_nanos(0),
+        )
+        .await;
+
+        // Delivery is the raw payload tagged with the real topic — even for the
+        // wildcard sub; the envelope is the per-connection codec's job.
+        let update = stream.next().await.expect("should receive");
+        assert_eq!(update.topic.as_deref(), Some("sensors.temp.vienna"));
+        assert_eq!(&update.data[..], b"22.5");
+    }
+
+    #[tokio::test]
+    async fn non_matching_topic_is_not_delivered() {
+        use futures_util::FutureExt;
+        let mgr = ClientManager::new(256);
+        let record_perms = simple_record_perms();
+        let (_id, mut stream) = mgr.subscribe("commands.#", record_perms);
+        mgr.broadcast("sensors.temp", 0, b"22.5", aimdb_core::Stamp::from_nanos(0))
+            .await;
+        // Nothing queued: the next() future is not ready.
+        assert!(stream.next().now_or_never().is_none());
+    }
+
+    #[tokio::test]
+    async fn full_channel_drops_surface_as_skipped_on_next_delivery() {
+        // Capacity 1: the second and third broadcasts have nowhere to go and are
+        // dropped, but the loss must ride the next delivered update's `skipped`
+        // so it becomes a `seq` gap downstream (not a silent hole).
+        let mgr = ClientManager::new(1);
+        let record_perms = simple_record_perms();
+        let (_id, mut stream) = mgr.subscribe("#", record_perms);
+
+        mgr.broadcast("t", 0, b"1", aimdb_core::Stamp::from_nanos(0))
+            .await; // fills the one slot
+        mgr.broadcast("t", 0, b"2", aimdb_core::Stamp::from_nanos(0))
+            .await; // full → dropped (counter = 1)
+        mgr.broadcast("t", 0, b"3", aimdb_core::Stamp::from_nanos(0))
+            .await; // full → dropped (counter = 2)
+
+        // First delivery is the update that got through, lossless.
+        let first = stream.next().await.expect("first update");
+        assert_eq!(&first.data[..], b"1");
+        assert_eq!(first.skipped, 0);
+
+        // With the slot now free, the next broadcast is delivered and carries the
+        // two drops that happened while the channel was full.
+        mgr.broadcast("t", 0, b"4", aimdb_core::Stamp::from_nanos(0))
+            .await;
+        let second = stream.next().await.expect("second update");
+        assert_eq!(&second.data[..], b"4");
+        assert_eq!(
+            second.skipped, 2,
+            "the two full-channel drops must be reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn fan_out_to_n_subscribers() {
+        let mgr = ClientManager::new(256);
+        let record_perms = simple_record_perms();
+        let mut streams: Vec<_> = (0..5)
+            .map(|_| mgr.subscribe("#", record_perms.clone()).1)
+            .collect();
+        mgr.broadcast("any/topic", 0, b"\"v\"", aimdb_core::Stamp::from_nanos(0))
+            .await;
+        for s in &mut streams {
+            let update = s.next().await.unwrap();
+            assert_eq!(update.topic.as_deref(), Some("any/topic"));
+        }
+    }
+
+    // A drop of Receiver (not Stream), does not lead to SubEntry dropped.
+    // Broadcast must handle the drop of matched pattern.
+    #[tokio::test]
+    async fn broadcast_prunes_closed_channel_matched_pattern() {
+        let mgr = ClientManager::new(256);
+        let record_perms = simple_record_perms();
+        let (tx, rx) = mpsc::channel::<SubUpdate>(256);
+        mgr.subs.insert(
+            1,
+            SubEntry {
+                pattern: "dropped_channel".to_string(),
+                tx,
+                dropped: AtomicU64::new(0),
+                record_perms,
+            },
+        );
+        drop(rx);
+        assert_eq!(mgr.subscription_count(), 1);
+
+        // Non-matching patterns survive the prune
+        mgr.broadcast("false_pattern", 0, b"v", aimdb_core::Stamp::from_nanos(0))
+            .await;
+        assert_eq!(mgr.subscription_count(), 1);
+
+        // Matched pattern get pruned
+        mgr.broadcast("dropped_channel", 0, b"v", aimdb_core::Stamp::from_nanos(0))
+            .await;
+        assert_eq!(mgr.subscription_count(), 0);
+    }
+
+    // One broadcast → N subscribers all receive the *same* payload allocation
+    // (a shared `Arc`), evidencing O(1) fan-out regardless of subscriber count.
+    #[tokio::test]
+    async fn broadcast_shares_one_payload_to_all() {
+        let mgr = ClientManager::new(256);
+        let record_perms = simple_record_perms();
+        let mut streams: Vec<_> = (0..8)
+            .map(|_| mgr.subscribe("#", record_perms.clone()).1)
+            .collect();
+        mgr.broadcast("t", 0, b"123", aimdb_core::Stamp::from_nanos(0))
+            .await;
+        let mut updates = Vec::new();
+        for s in &mut streams {
+            updates.push(s.next().await.unwrap());
+        }
+        let first = updates[0].data.as_ptr();
+        assert!(
+            updates.iter().all(|u| u.data.as_ptr() == first),
+            "every subscriber shares the one payload Arc"
+        );
+    }
+
+    // When a stream is dropped, its subscription in ClientManager
+    // together with its Sender must also be removed
+    #[tokio::test]
+    async fn subscription_dropped_when_stream_dropped() {
+        let mgr = ClientManager::new(256);
+        let record_perms = simple_record_perms();
+        let (_id, stream) = mgr.subscribe("quiet.topic", record_perms);
+
+        // Count before stream dropping
+        assert_eq!(mgr.subscription_count(), 1);
+        drop(stream);
+
+        // Associated entry must be unsubscribed
+        assert_eq!(mgr.subscription_count(), 0);
+    }
+}

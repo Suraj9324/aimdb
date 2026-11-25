@@ -1,0 +1,256 @@
+# Changelog - aimdb-embassy-adapter
+
+All notable changes to the `aimdb-embassy-adapter` crate will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Removed (breaking)
+
+- **The `std` feature (#419).** It existed only so `build.rs` could reject it:
+  enabling it panicked the build. Cargo now rejects `features = ["std"]`
+  itself; use `aimdb-tokio-adapter` on std hosts.
+
+### Removed
+
+- The crate's `build.rs` (#419). Apart from the `std` check, it emitted cfgs
+  nothing read (`no_std_enforced`, `feature_no_std`, `embedded_target`,
+  `core_available`) and a `--gc-sections` link argument that only reached this
+  crate's own test binaries. The `not(feature = "std")` gates in `lib.rs` go
+  with it.
+
+## [0.8.0] - 2026-11-03
+
+### Added
+
+- **`defmt` and `log` features (#365)**, next to `tracing`, choosing where the
+  adapter's operational diagnostics go, e.g. subscriber slot exhaustion on an
+  SPMC ring (target `aimdb_embassy_adapter::buffer`). `defmt` also enables
+  core's `defmt` reporting. None of them is on by default.
+
+### Changed (breaking)
+
+- **Write timestamps (#326).** `.buffer(cfg)` builds buffers of `Stamped<T>`.
+  `new_clock()` replaces `now_nanos`/`unix_time`; its origin is `build()`, and
+  `unix_time()` comes from the `set_unix_time` anchor.
+
+### Removed (breaking)
+
+- **`EmbassySinkRaw`, `EmbassySink`, `EmbassySourceRaw` and `EmbassySource`**.
+  They force-`Send`ed a `!Send` sink or source so it could ride
+  core's `pump_sink` / `pump_source`, which no longer exist: a connector now
+  runs its own task and pulls from `OutboundRoutes`. The `into_box_future`
+  helper and `NetStack` remain.
+
+### Fixed
+
+- **`EmbassyUart` could stall mid-reply on embassy-stm32 0.6.0 (#382).**
+  `BufferedUart::write` parks without a waker when a chunk exceeds the TX
+  ring's free space, so the first large reply after boot hung until RX
+  traffic arrived. `write_all` now flushes after each chunk, which keeps the
+  ring empty and the waker registered. To be removed once an embassy-stm32
+  release includes the upstream fix.
+
+### Changed
+
+- **`EmbassyTcpListener` no longer yields before returning an accept error
+  (#351).** It did so because core's `serve` retried a failed accept at once,
+  which spun the single-core executor; `serve` now yields before the accept
+  after an error itself, for every listener. The dial-side yield (a
+  synchronously failing `connect`) stays, for the client's reconnect loop.
+
+## [0.7.0] - 2026-09-18
+
+### Added
+
+- **`ByteStream::split` for `EmbassyTcpStream` and `EmbassyUart`.** The TCP
+  stream delegates to `embassy-net`'s own lock-free `TcpSocket::split` — both
+  halves are a copy of the socket's `io` handle — and a stream whose socket has
+  already gone still yields halves, which report `TransportError::Closed` on
+  use exactly as the unsplit methods do. `EmbassyUart` simply hands back the two
+  halves it was built from. Like the rest of this module the halves are
+  force-`Send` under the single-core cooperative-executor invariant, since
+  `TcpReader`/`TcpWriter` are `!Send`.
+
+- **`Delay` for `EmbassyTcpDialer`** (feature `embassy-time`). The dialer
+  supplies the session clock, so a connector generic over it needs no separate
+  handle — which is what keeps the MQTT call sites unchanged.
+
+### Fixed
+
+- **`EmbassyUdpBinder::bind` reports `TransportError::Busy`, not `Io`, when its
+  socket is already held.** The binder owns exactly one socket and `Clone`
+  shares it, so a clone binding while another handle holds it failed as a
+  generic `Io` — indistinguishable from a real bind failure, which a consumer's
+  retry loop treats as transient. A caller mistake then read as an endless
+  unexplained bind failure. `EmbassyTcpDialer` already returned `Busy` for the
+  identical case; the UDP binder now matches it, and its docs say (as the TCP
+  dialer's do) that `Clone` shares the socket, why the bound exists, and that a
+  second concurrent socket needs another `EmbassyNet::udp` call with its own
+  buffers — which matters because that constructor serves both KNX/IP and SNTP.
+  `tests/udp.rs` pins the variant (it previously asserted only `is_err()`, so it
+  passed either way) and adds the clone case the `Clone` derive invites,
+  including that releasing the socket frees the clone.
+
+### Changed (breaking)
+
+- **`EmbassyTcpDialer` resolves hostnames, and `net` therefore enables
+  `embassy-net/dns`.** `StreamDialer::connect` takes a host *string* and the
+  trait puts resolution on the adapter, but the Embassy dialer only parsed IP
+  literals — so a connector handing through a name dialed fine on
+  `TokioTcpDialer` and failed with `TransportError::Io` here, forever, on every
+  reconnect. Connectors papered over it with per-runtime validation gates (the
+  MQTT connector rejected any plain `mqtt://` host that was not an IPv4
+  literal); those are gone now that the contract holds on both adapters.
+  `EmbassyNet::tcp` takes the `Stack` into the dialer and queries it — `A`
+  first, `AAAA` only if that answers nothing — while an IP literal is still
+  parsed locally and never queried, so a stack with no resolver configured
+  dials literals exactly as before.
+  **Action required:** `embassy_net::new` adds the resolver socket itself, so
+  every application using the `net` feature must grow its `StackResources<N>`
+  by one; too small a `N` panics at stack construction. A name needs a DNS
+  server in the config (DHCP supplies one; `StaticConfigV4` lists them in
+  `dns_servers`). `tests/dns.rs` covers the name, literal and
+  does-not-resolve paths against two crossover-wired stacks.
+
+- **Issue #131 — `EmbassyAdapter` is a stateless unit type; network capability moves to connector construction.** The `EmbassyNetwork` trait and `EmbassyAdapter::new_with_network` are deleted (an `Arc<dyn RuntimeOps>` runtime can't surface adapter-specific capabilities); network connectors take the `embassy_net::Stack` at construction, wrapped in the new force-`Send + Sync` `connectors::NetStack` so the single-core `unsafe` stays in the audited `connectors` module — the adapter itself now carries **zero `unsafe`**. `EmbassyAdapter::new()` returns `Self` (was a never-failing `ExecutorResult<Self>` forcing `.unwrap()` at every call site) and `new_db_result()` is deleted. `NetStack::new` is an `unsafe fn`: the force-`Send + Sync` rests on the single-core cooperative-executor invariant, which the constructor cannot check, so each connector constructing one acknowledges it with a `SAFETY` comment (constructing on a multicore / multi-executor setup is UB). `EmbassyRecordRegistrarExt` shrinks to `.buffer(cfg)`; `EmbassyRecordRegistrarExtCustom` (`buffer_sized`, `source_with_context`) re-targets the non-generic `RecordRegistrar<'a, T>` with the concrete `RuntimeContext`, and `source_with_context` drops its needless `Sync` bounds (`Ctx: Send`, `F: Send`, matching core's relaxed `source`). `join_queue.rs` (`EmbassyJoinQueue`) is deleted with the `JoinFanInRuntime` family; the core join queue closes when forwarders exit (the Embassy queue previously never closed) and its capacity is 16 (was 8).
+
+### Added
+
+- **`net` feature — Embassy behind core's runtime-neutral I/O traits.** `EmbassyNet::tcp`,
+  `listen::<N>`, `udp` and `EmbassyUart` supply the sockets and UART halves;
+  `EmbassyDelay` is gated on `embassy-time` separately so a sockets-only consumer
+  does not pull in `defmt-timestamp-uptime`'s `_defmt_timestamp`. The listener
+  stores one pending accept per slot, so every socket stays in `LISTEN` between
+  accepts and no SYN is lost — proven against two real stacks. Both the dial and
+  accept paths hold their socket in a drop guard, so a cancelled `connect()` or
+  `accept()` returns it to its slot instead of leaving the slot permanently
+  empty, and both yield before reporting a synchronously-failing attempt so a
+  misconfigured endpoint (port-0 `InvalidPort`) warn-loops rather than spinning
+  the single-core executor. `EmbassyTcpDialer` is `Clone` so a framed dialer can
+  meet `SessionClientConnector`'s bound, but a clone **shares** the one socket
+  rather than duplicating it: a clone dialing while another handle holds the
+  link gets `TransportError::Busy`, not `Io`, so the client engine's dial-failed
+  warning names the real cause instead of looking like a dead peer. A second
+  concurrent connection needs a second `EmbassyNet::tcp` with its own buffers.
+- **`RuntimeOps` implemented for `EmbassyAdapter` (Issue #130, design 034 Phase 2).** The dyn-safe capability surface from `aimdb-executor`, gated on `embassy-time` like `TimeOps`: `now_nanos()` is boot-anchored uptime at microsecond granularity (the portable lower bound), `sleep` boxes `embassy_time::Timer::after`, `unix_time` rides the `set_unix_time` anchor, `log` forwards to the defmt-backed `Logger`. Covered by the shared contract test on the host (the test time driver now wakes immediately on `schedule_wake`, so already-expired timers complete; non-zero sleeps remain unusable on the pinned-at-0 host clock).
+- **M17 — centralized Embassy connector spines: the one audited home for the single-core `unsafe` ([Design 033](../docs/design/033-M17-unify-connectors-drop-send.md)).** New `connectors` module (features `connectors` / `connector-io`) collecting the force-`Send` plumbing every Embassy connector used to hand-roll, so a connector crate carries **no `unsafe` and no `SendFutureWrapper`**:
+  - **Session spine** — `EmbassySessionClient` / `EmbassySessionServer` (the Embassy duals of core's `SessionClientConnector` / `SessionServerConnector`), the one-shot `OneShotDialer` / `OneShotListener` over a moved-in peripheral connection (the listener parks forever after the first accept — point-to-point), and the force-`Send + Sync` `OneShotCell` for builders holding a moved-in value. `EmbassySessionClient::new` defaults to `reconnect: false` (unlike `ClientConfig::default`): a one-shot dialer can't redial, so the engine would otherwise spin on `TransportError::Io` forever; a re-dialable transport opts back in via `with_config`.
+  - **Framed connection** (feature `connector-io`) — `EmbassyConnection<Rd, Wr, F>` over `embedded-io-async` `Read`/`Write` halves with a pluggable `Framer` (COBS, length-prefix, …), chunking writes for atomic-or-error HAL `BufferedUart`s and skip-and-resync on undecodable runs.
+  - **Data-plane bridges** — `EmbassySinkRaw` / `EmbassySourceRaw` (the `!Send` duals of core's `Connector` / `Source`) with the force-`Send` `EmbassySink` / `EmbassySource` wrappers so an Embassy connector rides core's `pump_sink` / `pump_source` unchanged, plus `into_box_future` for long-lived `!Send` protocol tasks.
+  - Every `unsafe impl` cites one module-level invariant (single-core, cooperative Embassy executor — no preemption, no thread migration); the module is gated to `no_std` builds so the force-`Send` types can't leak into std/Tokio code. Host smoke tests (`tests/connectors_smoke.rs`) cover the one-shot cell/listener semantics and `serve` over the one-shot listener.
+- **Wall-clock anchor — `EmbassyAdapter::set_unix_time(now_unix_secs)` + `TimeOps::unix_time()` (Issue #120).** Embassy has no real-time clock, so `unix_time()` returns `None` until the device learns the real time (NTP / GPS / host handshake) and calls `set_unix_time` once (Unix **seconds**); thereafter it derives absolute `(secs, nanos)` from Embassy's monotonic uptime plus the anchor. The anchor is a process-global `u32` (Unix seconds at boot) — a natively-atomic word on Cortex-M, no `portable-atomic` / critical-section needed — with sub-second precision taken from uptime. Gated on `embassy-time`.
+- **`SendFutureWrapper` — shared force-`Send` wrapper for Embassy data-plane connectors (Issue #39).** New `pub` type (`no_std` only): asserts `Send` for a future driven exclusively by a single-core, cooperative Embassy executor, so an Embassy connector's `!Send` data-plane futures (over `NoopRawMutex` channels) satisfy the connector spine's `Send` `BoxFuture` bound. Consolidates the identical wrappers that the KNX and MQTT Embassy clients previously each hand-rolled.
+- **Session-engine smoke test on the Embassy clock (Issue #39, Phase 5, [design doc](../docs/design/remote-access-via-connectors.md)).** New `tests/session_smoke.rs` drives `aimdb-core`'s runtime-neutral `run_client` engine using the `EmbassyAdapter`'s `TimeOps` clock for reconnect backoff / keepalive — proving the shared session engines run on Embassy, not just Tokio. Dev-only: pulls in `aimdb-core` with the `connector-session` feature, so the normal `no_std` lib build and the `thumbv7em` cross-checks stay `alloc`-only.
+- **`EmbassyBuffer::peek()` (M15, Design 031).** Non-destructive buffer-native read matching the Tokio adapter's semantics: `SingleLatest` (`Watch`) via `Watch::try_get()`, `Mailbox` (`Channel<_, T, 1>`) via `Channel::try_peek()`, `SpmcRing` (`PubSubChannel`) returns `None`. Neither path consumes a receiver slot or advances a cursor.
+- **Embassy buffer + join-queue unit tests now run in CI on the host (Issue #85).** Previously the join-queue tests sat behind `feature = "embassy-runtime"`, which transitively pulls `embassy-executor`'s `platform-cortex-m` ARM assembly and fails to compile under `cargo test` on x86_64 — so ordering / backpressure / clone-routing regressions went uncaught. The `join_queue` module is now gated on `embassy-sync` instead (the `JoinFanInRuntime for EmbassyAdapter` impl keeps its own `embassy-runtime` gate), and `make test` runs `cargo test -p aimdb-embassy-adapter --no-default-features --features "alloc,embassy-sync,embassy-time"` (15 unit tests + doctests). A test-only no-op `#[defmt::global_logger]` / `#[defmt::panic_handler]` and a trivial `embassy-time-driver` satisfy the host link targets that `defmt` + `defmt-timestamp-uptime` would otherwise leave undefined.
+- **`embassy-time-driver` dev-dependency** — provides the trivial host time driver above (no tick feature, so it unifies with the workspace `tick-hz-32_768` rather than forcing `mock-driver`/`std`'s conflicting rate).
+
+### Fixed
+
+- **`TypedRecord::latest()` no longer always returns `None` on Embassy (M15).** With `latest_snapshot` removed in `aimdb-core`, reads go straight to the buffer via `peek()`; the Embassy adapter now implements `peek()` (above) so `latest()` returns the current value on `SingleLatest` / `Mailbox` instead of `None`.
+- **Stale `EmbassyBuffer` doc example.** It imported the removed `BufferBackend` trait (now `Buffer` / `BufferReader`) and put a non-`const` `new_spmc()` in a `static`; it never compiled because doctests didn't build on host before. Now corrected and exercised by `cargo test`'s doctest pass.
+- **Rustdoc links to feature-gated items.** The crate and `connectors` module docs linked `EmbassyBuffer` and `Framer` unconditionally, so `cargo doc` failed under any feature set that gates them out. `make doc` now passes `net` for this crate, so the new module's docs are covered by the `RUSTDOCFLAGS=-D warnings` CI already runs.
+
+### Changed
+
+- **Buffer and `nb` errors now carry their context on `no_std` (Issue #129).** With `DbError` unified on `alloc::String`, the adapter's error sites fill the real fields instead of `_field: ()` placeholders: the SPMC-ring/watch paths report `buffer_name` (`"embassy spmc ring"` / `"embassy watch"`), and `from_nb_error(WouldBlock)` reports `resource_name: "nb::WouldBlock"`. Allocation happens only on the error path.
+- **`buffer()` / `buffer_sized()` now record the `BufferCfg` (via `buffer_with_cfg`).** `buffer_info()` therefore reports the real buffer type and capacity in the dependency graph on `no_std` too (previously `"unknown"`), matching std behaviour. Mirrors the `aimdb-core` `impl_record_registrar_ext!` change (M15).
+
+### Changed (breaking)
+
+- **Generated extension trait emits `Producer<T>` / `Consumer<T>`** (no `, EmbassyAdapter`) via the updated `impl_record_registrar_ext!` macro from `aimdb-core` (Design 029, M14). Embassy demo signatures collapse from `Producer<LightControl, EmbassyAdapter>` to `Producer<LightControl>`.
+
+### Removed (breaking)
+
+- **`EmbassyDatabase` type alias removed (Issue #132, design 034 Phase 1).** It aliased the dead `aimdb_core::Database<EmbassyAdapter>` wrapper (also removed) and had no users in the workspace. Use `AimDb<EmbassyAdapter>` via `AimDbBuilder`.
+- **`impl Spawn for EmbassyAdapter` deleted (Issue #88).** Static `generic_task_runner` task pool gone, along with `BoxedFuture` and the `unsafe Pin::new_unchecked` cast that fed the pool. Drive database futures by awaiting `AimDbRunner::run()` from inside the Embassy main task.
+- **`embassy-task-pool-8` / `embassy-task-pool-16` / `embassy-task-pool-32` Cargo features deleted.** No pool — `FuturesUnordered` grows as needed within a single Embassy task's heap budget.
+- **`EmbassyAdapter::new_with_spawner(spawner)` constructor deleted.**
+- **`EmbassyAdapter::new_with_network(spawner, network)` signature changed** to `new_with_network(network)` — the `spawner` argument is gone. Update callers (three example binaries plus aimdb-pro docs).
+- `spawner: Option<Spawner>` field and `spawner()` accessor deleted.
+
+### Notes
+
+- `unsafe impl Send/Sync for EmbassyAdapter` is **retained** when the `embassy-net-support` feature is enabled: `embassy_net::Stack` contains a `RefCell` and is `!Sync`. Embassy's single-threaded cooperative executor makes this sound, and the impl now has a smaller surface (no `Spawner` to justify it).
+
+## [0.6.0] - 2026-05-22
+
+### Added
+
+- **`profiling` feature** (Issue #58): Forwards to `aimdb-core/profiling` and enables the Embassy runtime clock for stage timing. Pulls `portable-atomic` with `fallback` + `critical-section` (via `aimdb-core/profiling`) to emulate 64-bit atomics on targets without native `AtomicU64` (e.g. `thumbv7em-none-eabihf`). The final binary must provide a `critical-section` implementation — cortex-m and Embassy HALs already do.
+- **`TimeOps::duration_as_nanos` implementation**: Computes `duration.as_micros() * 1_000` (saturating). Microsecond resolution is the portable lower bound across Embassy tick-rate configurations.
+- **Cross-compile check in `make test-embedded`**: `cargo check --target thumbv7em-none-eabihf --no-default-features --features "embassy-runtime,profiling"` to guard the no_std + profiling path.
+- **`EmbassyJoinQueue` (Design 027)**: Embassy implementation of the `JoinFanInRuntime` traits from `aimdb-executor`, backed by `embassy_sync::channel::Channel<CriticalSectionRawMutex, T, 8>`. The channel is `Box::leak`ed at queue creation (once per join transform at DB startup) to obtain the `&'static` lifetime Embassy channels require. Embassy channels never close — the trigger loop runs for the device lifetime.
+- **`SpmcRing` subscriber-slot exhaustion diagnostics**: `defmt::error!` now fires when a `.subscribe()` call fails because the const-generic `SUBS` slot count is exhausted. Includes guidance to count one slot per `.link_to()` plus one per `transform_join` input.
+- **Improved `buffer_sized<CAP, CONSUMERS>` doc**: explicit rules for counting `CONSUMERS` (one per `.tap()`, `.link_to()`, and `transform_join` input).
+
+### Changed
+
+- **`aimdb-executor` dependency**: dropped the `embassy-types` feature (no longer required — the join queue is implemented locally in this adapter using `embassy_sync::Channel` directly).
+- **Dev-dependency update**: Upgraded `rand` from 0.8 to 0.10.1.
+- **Dev-dependency added**: `critical-section` with `std` feature, providing the `CriticalSectionRawMutex` link target for host-side join-queue tests.
+
+## [0.5.0] - 2026-02-21
+
+### Changed
+
+- **Dependency Update**: Updated `aimdb-core` dependency to 0.5.0
+
+## [0.4.0] - 2025-12-25
+
+### Changed
+
+- **Dependency Update**: Updated `aimdb-core` dependency to 0.4.0 for RecordKey trait support
+
+## [0.3.0] - 2025-12-15
+
+### Added
+
+- **DynBuffer Explicit Implementation**: `EmbassyBuffer` now explicitly implements `DynBuffer<T>` (required due to removal of blanket impl in aimdb-core)
+- **Metrics Feature Placeholder**: Added `metrics` feature flag (non-functional placeholder for API consistency). Actual metrics support requires std and is not available on embedded targets.
+
+### Changed
+
+- **Breaking: DynBuffer Implementation**: `EmbassyBuffer` now has an explicit `DynBuffer` implementation instead of relying on the removed blanket impl. `metrics_snapshot()` returns `None` on Embassy (metrics not supported on embedded).
+
+## [0.2.0] - 2025-11-20
+
+### Added
+
+- **Network Stack Access**: New `EmbassyNetwork` trait enables connectors to access Embassy's network stack for network-dependent operations
+- Network stack integration for connectors requiring TCP/UDP communication
+
+### Changed
+
+- Enhanced runtime adapter with improved task management for connector support
+- Updated Embassy submodule to latest commit with improved async runtime support
+- Updated connector integration to support new `ConnectorBuilder` pattern
+
+## [0.1.0] - 2025-11-06
+
+### Added
+
+- Initial release of Embassy runtime adapter for embedded AimDB deployments
+- Configurable task pool sizes (8/16/32 concurrent tasks via feature flags)
+- Optimized for resource-constrained devices
+- Compatible with ARM Cortex-M targets (`thumbv7em-none-eabihf`, `thumbv8m.main-none-eabihf`)
+- `no_std` compatibility with `alloc` support
+- Simplified buffer API with 2-parameter configuration
+- Task spawning for Embassy executor
+- Time operations with Embassy's async Timer
+- Logging integration with defmt
+
+---
+
+[Unreleased]: https://github.com/aimdb-dev/aimdb/compare/v3.0.0...HEAD
+[0.8.0]: https://github.com/aimdb-dev/aimdb/compare/v2.0.0...v3.0.0
+[0.7.0]: https://github.com/aimdb-dev/aimdb/compare/v1.1.0...v2.0.0
+[0.6.0]: https://github.com/aimdb-dev/aimdb/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/aimdb-dev/aimdb/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/aimdb-dev/aimdb/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/aimdb-dev/aimdb/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/aimdb-dev/aimdb/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/aimdb-dev/aimdb/releases/tag/v0.1.0

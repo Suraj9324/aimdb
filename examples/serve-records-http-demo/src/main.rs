@@ -1,0 +1,87 @@
+//! Plain-text HTTP polling of current record values, without mirrored state.
+use std::{sync::Arc, time::Duration};
+
+use aimdb_core::{buffer::BufferCfg, AimDb, AimDbBuilder};
+use aimdb_tokio_adapter::{TokioAdapter, TokioRecordRegistrarExt};
+use aimdb_websocket_connector::WebSocketConnector;
+use axum::{http::StatusCode, routing::get, Extension, Router};
+
+// These types deliberately do not implement serde traits.
+#[derive(Clone, Debug)]
+struct Temperature(f32);
+#[derive(Clone, Debug)]
+struct Humidity(f32);
+#[derive(Clone, Debug)]
+struct WindowContact(bool);
+const WINDOW: aimdb_core::Name<WindowContact> = aimdb_core::Name::new("room.window");
+const HUMIDITY: aimdb_core::Name<Humidity> = aimdb_core::Name::new("room.humidity");
+const TEMPERATURE: aimdb_core::Name<Temperature> = aimdb_core::Name::new("room.temperature");
+
+fn current<N: aimdb_core::TypedName>(db: &AimDb, key: N) -> Result<N::Contract, StatusCode> {
+    db.latest(key)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(|sample| sample.value)
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+async fn temperature(Extension(db): Extension<AimDb>) -> Result<String, StatusCode> {
+    Ok(format!("{:.1}", current(&db, TEMPERATURE)?.0))
+}
+
+async fn humidity(Extension(db): Extension<AimDb>) -> Result<String, StatusCode> {
+    Ok(format!("{:.1}", current(&db, HUMIDITY)?.0))
+}
+
+async fn window(Extension(db): Extension<AimDb>) -> Result<String, StatusCode> {
+    Ok(if current(&db, WINDOW)?.0 { "1" } else { "0" }.into())
+}
+
+fn update(db: &AimDb, tick: u32) -> aimdb_core::DbResult<()> {
+    db.produce(TEMPERATURE, Temperature(21.5 + (tick % 10) as f32 * 0.1))?;
+    db.produce(HUMIDITY, Humidity(45.0 + (tick % 20) as f32 * 0.5))?;
+    db.produce(WINDOW, WindowContact((tick / 5) % 2 == 1))?;
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Change to e.g. "0.0.0.0:8080" to allow LAN clients.
+    let addr = "127.0.0.1:8080";
+    let routes = Router::new()
+        .route("/temperature", get(temperature))
+        .route("/humidity", get(humidity))
+        .route("/window", get(window));
+    let mut builder = AimDbBuilder::new()
+        .runtime(Arc::new(TokioAdapter))
+        .with_connector(
+            WebSocketConnector::new()
+                .bind(addr)
+                .with_additional_routes(routes),
+        );
+    builder.configure(TEMPERATURE, |reg| {
+        reg.buffer(BufferCfg::SingleLatest);
+    });
+    builder.configure(HUMIDITY, |reg| {
+        reg.buffer(BufferCfg::SingleLatest);
+    });
+    builder.configure(WINDOW, |reg| {
+        reg.buffer(BufferCfg::SingleLatest);
+    });
+    let (db, runner) = builder.build().await?;
+    update(&db, 0)?;
+    let server = tokio::spawn(runner.run());
+    println!("Polling endpoints: http://{addr}/temperature, /humidity, /window");
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    let mut tick = 0u32;
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = interval.tick() => {
+                update(&db, tick)?;
+                tick = tick.wrapping_add(1);
+            }
+        }
+    }
+    server.abort();
+    Ok(())
+}

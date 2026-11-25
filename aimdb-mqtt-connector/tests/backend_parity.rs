@@ -1,0 +1,913 @@
+//! Both backends against the same broker, in one process
+//! (`_test-backend-parity`).
+//!
+//! `Native` is `rumqttc` over MQTT 3.1.1, `Embedded` is `mountain-mqtt` over
+//! MQTT 5 — interchangeable from a record's point of view: same link URLs, same
+//! payloads on the wire.
+#![cfg(feature = "_test-backend-parity")]
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio::net::TcpListener;
+
+use aimdb_core::buffer::BufferCfg;
+use aimdb_core::AimDbBuilder;
+use aimdb_mqtt_connector::{MqttConnector, MqttLinkExt};
+use aimdb_tokio_adapter::net::TokioNet;
+use aimdb_tokio_adapter::{TokioAdapter, TokioRecordRegistrarExt};
+
+mod common;
+use common::{fake_broker_concurrent, Seen};
+
+// Each test binary defines these exactly once.
+#[defmt::global_logger]
+struct HostTestLogger;
+unsafe impl defmt::Logger for HostTestLogger {
+    fn acquire() {}
+    unsafe fn flush() {}
+    unsafe fn release() {}
+    unsafe fn write(_bytes: &[u8]) {}
+}
+#[defmt::panic_handler]
+fn defmt_panic() -> ! {
+    core::panic!("defmt panic in host test")
+}
+// Nothing else defines `_defmt_timestamp` now that the connector pulls no
+// crate enabling `embassy-time/defmt-timestamp-uptime`.
+defmt::timestamp!("{=u64:us}", 0);
+
+struct HostClock;
+impl embassy_time_driver::Driver for HostClock {
+    fn now(&self) -> u64 {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static START: OnceLock<Instant> = OnceLock::new();
+        let start = START.get_or_init(Instant::now);
+        (start.elapsed().as_micros() * u128::from(embassy_time_driver::TICK_HZ) / 1_000_000) as u64
+    }
+    fn schedule_wake(&self, _at: u64, waker: &core::task::Waker) {
+        waker.wake_by_ref();
+    }
+}
+embassy_time_driver::time_driver_impl!(static HOST_CLOCK: HostClock = HostClock);
+
+const INBOUND: &str = "mqtt://parity/inbound";
+const OUTBOUND: &str = "mqtt://parity/outbound";
+
+/// One database with one inbound and one outbound record, so both backends are
+/// exercised through identical registrations.
+fn build_db(
+    connector: impl aimdb_core::ConnectorBuilder + 'static,
+    value: u64,
+) -> impl std::future::Future<Output = (aimdb_core::AimDb, aimdb_core::builder::AimDbRunner)> {
+    let key_inbound_1 = aimdb_core::Name::<u64>::new("inbound");
+    let key_outbound_2 = aimdb_core::Name::<u64>::new("outbound");
+    let mut builder = AimDbBuilder::new()
+        .runtime(Arc::new(TokioAdapter))
+        .with_connector(connector);
+
+    builder.configure(key_inbound_1, |reg| {
+        reg.buffer(BufferCfg::SingleLatest)
+            .link_from(INBOUND)
+            .with_deserializer(|_ctx, data: &[u8]| {
+                core::str::from_utf8(data)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .ok_or_else(|| aimdb_core::IngestError::from("bad payload"))
+            })
+            .finish();
+    });
+
+    builder.configure(key_outbound_2, move |reg| {
+        reg.buffer(BufferCfg::SingleLatest)
+            .source(move |_ctx, producer| async move {
+                loop {
+                    producer.produce(value);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .link_to(OUTBOUND)
+            .with_serializer(|_ctx, v: &u64| Ok(v.to_string().into_bytes()))
+            .finish();
+    });
+
+    async move { builder.build().await.expect("build db") }
+}
+
+/// Both backends complete a session against the same broker at the same time,
+/// and a record round-trips through each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn both_backends_round_trip_against_one_broker() {
+    let key_inbound_3 = aimdb_core::Name::<u64>::new("inbound");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("mqtt://127.0.0.1:{port}");
+    let seen = Arc::new(Mutex::new(Seen::default()));
+
+    // One `new` whichever backends are compiled in: the transport, or its
+    // absence, picks the backend.
+    let native = MqttConnector::new(url.clone()).with_client_id("parity-native");
+    let embedded = MqttConnector::new(url)
+        .transport(TokioNet::tcp())
+        .with_client_id("parity-embedded");
+
+    let (native_db, native_runner) = build_db(native, 1).await;
+    let (embedded_db, embedded_runner) = build_db(embedded, 2).await;
+
+    let mut native_in = native_db
+        .consumer(key_inbound_3)
+        .expect("native consumer")
+        .subscribe();
+    let mut embedded_in = embedded_db
+        .consumer(key_inbound_3)
+        .expect("embedded consumer")
+        .subscribe();
+
+    let broker = fake_broker_concurrent(listener, seen.clone(), Some(("parity/inbound", b"7")));
+    let seen_for_wait = seen.clone();
+
+    let (native_value, embedded_value) = tokio::select! {
+        _ = native_runner.run() => panic!("the native runner returned"),
+        _ = embedded_runner.run() => panic!("the embedded runner returned"),
+        _ = broker => panic!("the broker returned"),
+        values = async {
+            let values = (
+                native_in.recv().await.expect("native inbound").value,
+                embedded_in.recv().await.expect("embedded inbound").value,
+            );
+            // Both outbound links must land before the assertions below.
+            while seen_for_wait.lock().unwrap().published.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            values
+        } => values,
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            let seen = seen.lock().unwrap();
+            panic!(
+                "watchdog: {} connects, {:?} subscribed, {} published",
+                seen.connects,
+                seen.subscribed_topics(),
+                seen.published.len()
+            );
+        }
+    };
+
+    assert_eq!(native_value, 7, "the broker's PUBLISH must reach Native");
+    assert_eq!(
+        embedded_value, 7,
+        "the broker's PUBLISH must reach Embedded"
+    );
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.connects, 2, "both backends must connect");
+    assert_eq!(
+        seen.subscribed_topics()
+            .iter()
+            .filter(|t| **t == "parity/inbound")
+            .count(),
+        2,
+        "both backends must subscribe the inbound topic"
+    );
+
+    // Same record, same serializer, same bytes — whichever backend carried it.
+    let mut payloads: Vec<&[u8]> = seen
+        .published
+        .iter()
+        .filter(|(topic, _)| topic == "parity/outbound")
+        .map(|(_, payload)| payload.as_slice())
+        .collect();
+    payloads.sort_unstable();
+    payloads.dedup();
+    assert_eq!(
+        payloads,
+        vec![b"1".as_slice(), b"2".as_slice()],
+        "each backend must publish its own record's bytes"
+    );
+}
+
+fn parse(data: &[u8]) -> Result<u64, aimdb_core::IngestError> {
+    core::str::from_utf8(data)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .ok_or_else(|| aimdb_core::IngestError::from("bad payload"))
+}
+
+/// Deserializer calls per record.
+#[derive(Default)]
+struct Calls {
+    pattern: AtomicUsize,
+    exact: AtomicUsize,
+}
+
+/// A keyed pattern record beside an exact record whose topic it covers.
+fn build_pattern_db(
+    connector: impl aimdb_core::ConnectorBuilder + 'static,
+    calls: Arc<Calls>,
+) -> impl std::future::Future<Output = (aimdb_core::AimDb, aimdb_core::builder::AimDbRunner)> {
+    let key_readings_4 = aimdb_core::Name::<u64>::new("readings");
+    let key_kitchen_5 = aimdb_core::Name::<u64>::new("kitchen");
+    let mut builder = AimDbBuilder::new()
+        .runtime(Arc::new(TokioAdapter))
+        .with_connector(connector);
+
+    let pattern_calls = calls.clone();
+    builder.configure(key_readings_4, move |reg| {
+        reg.buffer(BufferCfg::SingleLatest)
+            .link_from("mqtt://parity/{device}/in")
+            .key("device", 4)
+            .with_match_deserializer(move |_ctx, m, data: &[u8]| {
+                pattern_calls.pattern.fetch_add(1, Ordering::SeqCst);
+                match (m.get("device"), m.key().map(|k| k.index())) {
+                    (Some("kitchen"), Some(0)) => parse(data),
+                    other => Err(format!("unexpected match {other:?}").into()),
+                }
+            })
+            .finish();
+    });
+
+    builder.configure(key_kitchen_5, move |reg| {
+        reg.buffer(BufferCfg::SingleLatest)
+            .link_from("mqtt://parity/kitchen/in")
+            .with_deserializer(move |_ctx, data: &[u8]| {
+                calls.exact.fetch_add(1, Ordering::SeqCst);
+                parse(data)
+            })
+            .finish();
+    });
+
+    async move { builder.build().await.expect("build db") }
+}
+
+/// A pattern link beside an exact link it covers: each backend subscribes only
+/// the covering filter, each record receives the broker's one PUBLISH once,
+/// and the capture and key reach the deserializer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pattern_link_covers_exact_link_on_both_backends() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("mqtt://127.0.0.1:{port}");
+    let seen = Arc::new(Mutex::new(Seen::default()));
+
+    let native = MqttConnector::new(url.clone()).with_client_id("pattern-native");
+    let embedded = MqttConnector::new(url)
+        .transport(TokioNet::tcp())
+        .with_client_id("pattern-embedded");
+    let (native_calls, embedded_calls) = (Arc::new(Calls::default()), Arc::new(Calls::default()));
+    let (native_db, native_runner) = build_pattern_db(native, native_calls.clone()).await;
+    let (embedded_db, embedded_runner) = build_pattern_db(embedded, embedded_calls.clone()).await;
+
+    let mut inbound = Vec::new();
+    for db in [&native_db, &embedded_db] {
+        for record in ["readings", "kitchen"] {
+            let record_key_1 = aimdb_core::Name::<u64>::new(record);
+            inbound.push(db.consumer(record_key_1).expect("consumer").subscribe());
+        }
+    }
+
+    let broker = fake_broker_concurrent(listener, seen.clone(), Some(("parity/kitchen/in", b"7")));
+    let values = tokio::select! {
+        _ = native_runner.run() => panic!("the native runner returned"),
+        _ = embedded_runner.run() => panic!("the embedded runner returned"),
+        _ = broker => panic!("the broker returned"),
+        values = async {
+            let mut values = Vec::new();
+            for reader in &mut inbound {
+                values.push(reader.recv().await.expect("inbound").value);
+            }
+            // Room for a second delivery, which must not come.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            values
+        } => values,
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            let seen = seen.lock().unwrap();
+            panic!("watchdog: {:?} subscribed", seen.subscribed_topics());
+        }
+    };
+
+    assert_eq!(values, [7, 7, 7, 7], "every record on both backends gets 7");
+    for (backend, calls) in [("native", &native_calls), ("embedded", &embedded_calls)] {
+        assert_eq!(
+            calls.pattern.load(Ordering::SeqCst),
+            1,
+            "{backend} pattern link"
+        );
+        assert_eq!(
+            calls.exact.load(Ordering::SeqCst),
+            1,
+            "{backend} exact link"
+        );
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.subscribed_topics(),
+        ["parity/+/in", "parity/+/in"],
+        "each backend subscribes only the covering filter"
+    );
+}
+
+/// Three inbound links: a pattern, an exact link it covers asking for
+/// `qos=2`, and a link of its own asking for `qos=0`.
+fn build_qos_db(
+    connector: impl aimdb_core::ConnectorBuilder + 'static,
+) -> impl std::future::Future<Output = (aimdb_core::AimDb, aimdb_core::builder::AimDbRunner)> {
+    let mut builder = AimDbBuilder::new()
+        .runtime(Arc::new(TokioAdapter))
+        .with_connector(connector);
+    for (key, topic, qos) in [
+        ("readings", "mqtt://parity/{device}/in", None),
+        ("kitchen", "mqtt://parity/kitchen/in", Some(2)),
+        ("telemetry", "mqtt://parity/telemetry", Some(0)),
+    ] {
+        let record_key_2 = aimdb_core::Name::<u64>::interned(key);
+        builder.configure(record_key_2, move |reg| {
+            let mut link = reg
+                .buffer(BufferCfg::SingleLatest)
+                .link_from(topic)
+                .with_deserializer(|_ctx, data: &[u8]| parse(data));
+            if let Some(qos) = qos {
+                link = link.with_qos(qos);
+            }
+            link.finish();
+        });
+    }
+    async move { builder.build().await.expect("build db") }
+}
+
+/// What one backend subscribes, against a broker of its own, so each SUBSCRIBE
+/// is known to come from that backend.
+async fn subscribed_qos<C: aimdb_core::ConnectorBuilder + 'static>(
+    connector: impl FnOnce(String) -> C,
+) -> Vec<(String, u8)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let (_db, runner) = build_qos_db(connector(format!("mqtt://127.0.0.1:{port}"))).await;
+
+    let broker = fake_broker_concurrent(listener, seen.clone(), None);
+    let seen_for_wait = seen.clone();
+    tokio::select! {
+        _ = runner.run() => panic!("the runner returned"),
+        _ = broker => panic!("the broker returned"),
+        _ = async {
+            while seen_for_wait.lock().unwrap().subscribed_qos.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        } => {}
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            panic!("watchdog: subscribed {:?}", seen.lock().unwrap().subscribed_qos);
+        }
+    }
+
+    let mut subscribed = seen.lock().unwrap().subscribed_qos.clone();
+    subscribed.sort();
+    subscribed
+}
+
+/// Each filter is subscribed at the highest `qos` among the links it covers:
+/// the covered exact link's `qos=2` lifts its covering pattern. The native
+/// backend honours 2; the embedded one has no QoS 2 and subscribes at 1. A
+/// link asking for `qos=0` alone is subscribed at 0 on both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbound_qos_reaches_the_subscribe_on_both_backends() {
+    let native = subscribed_qos(|url| MqttConnector::new(url).with_client_id("qos-native")).await;
+    let embedded = subscribed_qos(|url| {
+        MqttConnector::new(url)
+            .transport(TokioNet::tcp())
+            .with_client_id("qos-embedded")
+    })
+    .await;
+
+    let expected = |covering| {
+        vec![
+            ("parity/+/in".to_string(), covering),
+            ("parity/telemetry".to_string(), 0),
+        ]
+    };
+    assert_eq!(native, expected(2), "native honours qos=2");
+    assert_eq!(embedded, expected(1), "embedded caps qos=2 at 1");
+}
+
+/// `with_credentials` reaches the wire on both backends.
+///
+/// A setter that was accepted and then dropped would look exactly like success,
+/// so the assertion is on the CONNECT packet the broker saw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_credentials_reaches_the_wire_on_both_backends() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("mqtt://127.0.0.1:{port}");
+    let seen = Arc::new(Mutex::new(Seen::default()));
+
+    let native = MqttConnector::new(url.clone())
+        .with_client_id("creds-native")
+        .with_credentials("hub", "s3cret");
+    let embedded = MqttConnector::new(url)
+        .transport(TokioNet::tcp())
+        .with_client_id("creds-embedded")
+        .with_credentials("hub", "s3cret");
+
+    let (_native_db, native_runner) = build_db(native, 1).await;
+    let (_embedded_db, embedded_runner) = build_db(embedded, 2).await;
+
+    let broker = fake_broker_concurrent(listener, seen.clone(), None);
+    let seen_for_wait = seen.clone();
+
+    tokio::select! {
+        _ = native_runner.run() => panic!("the native runner returned"),
+        _ = embedded_runner.run() => panic!("the embedded runner returned"),
+        _ = broker => panic!("the broker returned"),
+        _ = async {
+            while seen_for_wait.lock().unwrap().credentials.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        } => {}
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            panic!("watchdog: saw {:?}", seen.lock().unwrap().credentials);
+        }
+    }
+
+    let seen = seen.lock().unwrap();
+    let expected = Some((String::from("hub"), String::from("s3cret")));
+    for (n, credentials) in seen.credentials.iter().enumerate() {
+        assert_eq!(
+            *credentials, expected,
+            "connection {n} ({}) dropped the credentials",
+            seen.client_ids[n]
+        );
+    }
+}
+
+/// Credentials in the broker URL's authority reach the wire on both backends.
+///
+/// The sibling above covers the explicit setter. This one covers
+/// `mqtt://user:pass@host`, which the embedded backend used to parse for its
+/// host and port and then drop — producing an unauthenticated CONNECT, a
+/// rejecting broker, and a silent reconnect loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn url_credentials_reach_the_wire_on_both_backends() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("mqtt://hub:s3cret@127.0.0.1:{port}");
+    let seen = Arc::new(Mutex::new(Seen::default()));
+
+    let native = MqttConnector::new(url.clone()).with_client_id("url-creds-native");
+    let embedded = MqttConnector::new(url)
+        .transport(TokioNet::tcp())
+        .with_client_id("url-creds-embedded");
+
+    let (_native_db, native_runner) = build_db(native, 1).await;
+    let (_embedded_db, embedded_runner) = build_db(embedded, 2).await;
+
+    let broker = fake_broker_concurrent(listener, seen.clone(), None);
+    let seen_for_wait = seen.clone();
+
+    tokio::select! {
+        _ = native_runner.run() => panic!("the native runner returned"),
+        _ = embedded_runner.run() => panic!("the embedded runner returned"),
+        _ = broker => panic!("the broker returned"),
+        _ = async {
+            while seen_for_wait.lock().unwrap().credentials.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        } => {}
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            panic!("watchdog: saw {:?}", seen.lock().unwrap().credentials);
+        }
+    }
+
+    let seen = seen.lock().unwrap();
+    let expected = Some((String::from("hub"), String::from("s3cret")));
+    for (n, credentials) in seen.credentials.iter().enumerate() {
+        assert_eq!(
+            *credentials, expected,
+            "connection {n} ({}) dropped the URL's credentials",
+            seen.client_ids[n]
+        );
+    }
+}
+
+/// The explicit setter overrides what the URL carries, on both backends.
+///
+/// `with_credentials` is the only way to name a password that is not URL-safe,
+/// so it has to win rather than merely fill a gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_setter_overrides_url_credentials_on_both_backends() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("mqtt://urluser:urlpass@127.0.0.1:{port}");
+    let seen = Arc::new(Mutex::new(Seen::default()));
+
+    let native = MqttConnector::new(url.clone())
+        .with_client_id("override-native")
+        .with_credentials("hub", "s3cret");
+    let embedded = MqttConnector::new(url)
+        .transport(TokioNet::tcp())
+        .with_client_id("override-embedded")
+        .with_credentials("hub", "s3cret");
+
+    let (_native_db, native_runner) = build_db(native, 1).await;
+    let (_embedded_db, embedded_runner) = build_db(embedded, 2).await;
+
+    let broker = fake_broker_concurrent(listener, seen.clone(), None);
+    let seen_for_wait = seen.clone();
+
+    tokio::select! {
+        _ = native_runner.run() => panic!("the native runner returned"),
+        _ = embedded_runner.run() => panic!("the embedded runner returned"),
+        _ = broker => panic!("the broker returned"),
+        _ = async {
+            while seen_for_wait.lock().unwrap().credentials.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        } => {}
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            panic!("watchdog: saw {:?}", seen.lock().unwrap().credentials);
+        }
+    }
+
+    let seen = seen.lock().unwrap();
+    let expected = Some((String::from("hub"), String::from("s3cret")));
+    for (n, credentials) in seen.credentials.iter().enumerate() {
+        assert_eq!(
+            *credentials, expected,
+            "connection {n} ({}) let the URL win over the setter",
+            seen.client_ids[n]
+        );
+    }
+}
+
+/// Both backends promise the broker the same keep-alive, and `with_keep_alive`
+/// is what sets it.
+///
+/// They used to disagree on an unset default — `rumqttc` hard-coded 30 s while
+/// the embedded path sent mountain-mqtt's 60 s — for one and the same route
+/// URL. The embedded session additionally pinged every 2 s regardless, an
+/// inherited constant unrelated to what it had promised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn both_backends_promise_the_keep_alive_they_were_given() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("mqtt://127.0.0.1:{port}");
+    let seen = Arc::new(Mutex::new(Seen::default()));
+
+    let keep_alive = Duration::from_secs(45);
+    let native = MqttConnector::new(url.clone())
+        .with_client_id("ka-native")
+        .with_keep_alive(keep_alive);
+    let embedded = MqttConnector::new(url)
+        .transport(TokioNet::tcp())
+        .with_client_id("ka-embedded")
+        .with_keep_alive(keep_alive);
+
+    let (_native_db, native_runner) = build_db(native, 1).await;
+    let (_embedded_db, embedded_runner) = build_db(embedded, 2).await;
+
+    let broker = fake_broker_concurrent(listener, seen.clone(), None);
+    let seen_for_wait = seen.clone();
+
+    tokio::select! {
+        _ = native_runner.run() => panic!("the native runner returned"),
+        _ = embedded_runner.run() => panic!("the embedded runner returned"),
+        _ = broker => panic!("the broker returned"),
+        _ = async {
+            while seen_for_wait.lock().unwrap().keep_alives.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        } => {}
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            panic!("watchdog: saw {:?}", seen.lock().unwrap().keep_alives);
+        }
+    }
+
+    let seen = seen.lock().unwrap();
+    for (n, promised) in seen.keep_alives.iter().enumerate() {
+        assert_eq!(
+            *promised, 45,
+            "connection {n} ({}) promised a keep-alive it was not given",
+            seen.client_ids[n]
+        );
+    }
+}
+
+/// A keep-alive too short to halve is refused at build, not quietly adjusted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_keep_alive_below_the_floor_fails_the_build() {
+    let key_outbound_6 = aimdb_core::Name::<u64>::new("outbound");
+    // Port 1 is never listened on here: the build must fail on the keep-alive
+    // before anything is dialled.
+    let connector = MqttConnector::new("mqtt://127.0.0.1:1")
+        .transport(TokioNet::tcp())
+        .with_keep_alive(Duration::from_secs(1));
+
+    let mut builder = AimDbBuilder::new()
+        .runtime(Arc::new(TokioAdapter))
+        .with_connector(connector);
+    builder.configure(key_outbound_6, |reg| {
+        reg.buffer(BufferCfg::SingleLatest)
+            .source(|_ctx, producer| async move { producer.produce(1) })
+            .link_to(OUTBOUND)
+            .with_serializer(|_ctx, v: &u64| Ok(v.to_string().into_bytes()))
+            .finish();
+    });
+
+    let Err(err) = builder.build().await else {
+        panic!("a 1s keep-alive must be refused");
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("keep-alive") && message.contains("10"),
+        "the error should name the floor, got: {message}"
+    );
+}
+
+/// A **hostname** is a broker address on both backends.
+///
+/// Resolving `host` is the dialer's job on every adapter, so `.transport(..)`
+/// makes no difference to which broker URLs are accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hostname_is_a_broker_address_on_both_backends() {
+    // Bound by name, so the address the broker listens on is whichever one
+    // `localhost` resolves to first here — the same one the dialers get.
+    let listener = TcpListener::bind("localhost:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("mqtt://localhost:{port}");
+    let seen = Arc::new(Mutex::new(Seen::default()));
+
+    let native = MqttConnector::new(url.clone()).with_client_id("host-native");
+    let embedded = MqttConnector::new(url)
+        .transport(TokioNet::tcp())
+        .with_client_id("host-embedded");
+
+    let (_native_db, native_runner) = build_db(native, 1).await;
+    let (_embedded_db, embedded_runner) = build_db(embedded, 2).await;
+
+    let broker = fake_broker_concurrent(listener, seen.clone(), None);
+    let seen_for_wait = seen.clone();
+
+    tokio::select! {
+        _ = native_runner.run() => panic!("the native runner returned"),
+        _ = embedded_runner.run() => panic!("the embedded runner returned"),
+        _ = broker => panic!("the broker returned"),
+        _ = async {
+            while seen_for_wait.lock().unwrap().connects < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        } => {}
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            let seen = seen.lock().unwrap();
+            panic!(
+                "watchdog: only {} of 2 backends connected by name ({:?})",
+                seen.connects, seen.client_ids
+            );
+        }
+    }
+
+    let seen = seen.lock().unwrap();
+    let mut ids = seen.client_ids.clone();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![String::from("host-embedded"), String::from("host-native")],
+        "both backends must reach the broker through a hostname"
+    );
+}
+
+/// What one backend, registered under `mqtt-cloud`, subscribes and publishes
+/// for an inbound and an outbound `mqtt-cloud://` link.
+async fn carried_under_scheme<C: aimdb_core::ConnectorBuilder + 'static>(
+    connector: impl FnOnce(String) -> C,
+) -> (Vec<String>, String) {
+    let key_command_7 = aimdb_core::Name::<u64>::new("command");
+    let key_flow_avg_8 = aimdb_core::Name::<u64>::new("flow_avg");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Seen::default()));
+
+    let mut builder = AimDbBuilder::new()
+        .runtime(Arc::new(TokioAdapter))
+        .with_connector(connector(format!("mqtt://127.0.0.1:{port}")));
+    builder.configure(key_command_7, |reg| {
+        reg.buffer(BufferCfg::SingleLatest)
+            .link_from("mqtt-cloud://parity/command")
+            .with_deserializer(|_ctx, data: &[u8]| parse(data))
+            .finish();
+    });
+    builder.configure(key_flow_avg_8, |reg| {
+        reg.buffer(BufferCfg::SingleLatest)
+            .source(|_ctx, producer| async move {
+                loop {
+                    producer.produce(8u64);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .link_to("mqtt-cloud://parity/flow_avg")
+            .with_serializer(|_ctx, v: &u64| Ok(v.to_string().into_bytes()))
+            .finish();
+    });
+    let (_db, runner) = builder.build().await.expect("build db");
+
+    let broker = fake_broker_concurrent(listener, seen.clone(), None);
+    let seen_for_wait = seen.clone();
+    tokio::select! {
+        _ = runner.run() => panic!("the runner returned"),
+        _ = broker => panic!("the broker returned"),
+        _ = async {
+            loop {
+                {
+                    let seen = seen_for_wait.lock().unwrap();
+                    if !seen.subscribes.is_empty() && !seen.published.is_empty() {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        } => {}
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            let seen = seen.lock().unwrap();
+            panic!("watchdog: subscribed {:?}, published {:?}", seen.subscribes, seen.published);
+        }
+    }
+
+    let seen = seen.lock().unwrap();
+    let subscribed = seen
+        .subscribed_topics()
+        .into_iter()
+        .map(String::from)
+        .collect();
+    (subscribed, seen.published[0].0.clone())
+}
+
+/// A configured scheme routes on both backends: the `mqtt-cloud://` links
+/// reach the broker, which they could not if either backend still collected
+/// its routes under `mqtt`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_configured_scheme_routes_on_both_backends() {
+    let native = carried_under_scheme(|url| {
+        MqttConnector::new(url)
+            .scheme("mqtt-cloud")
+            .with_client_id("scheme-native")
+    })
+    .await;
+    let embedded = carried_under_scheme(|url| {
+        MqttConnector::new(url)
+            .scheme("mqtt-cloud")
+            .transport(TokioNet::tcp())
+            .with_client_id("scheme-embedded")
+    })
+    .await;
+
+    let expected = (
+        vec!["parity/command".to_string()],
+        "parity/flow_avg".to_string(),
+    );
+    assert_eq!(native, expected, "native");
+    assert_eq!(embedded, expected, "embedded");
+}
+
+#[path = "../../aimdb-data-contracts/tests/fixtures/admission_contracts.rs"]
+mod envelope_contracts;
+
+/// The transport treats the inline header as opaque bytes on both backends.
+/// End-to-end forwarding from an MCU producer is covered by the rolling fixture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inline_envelopes_upgrade_and_downgrade_on_both_backends() {
+    use aimdb_core::envelope::{ContractRef, Envelope, HeaderWriter, PayloadCodec};
+    use aimdb_data_contracts::{
+        link_codecs::Postcard, EnvelopeCarrier, EnvelopeLinkExt, LinkCodecBuilderExt,
+        MigrationChain, VersionedInboundExt, VersionedOutboundExt,
+    };
+    use envelope_contracts::V2;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("mqtt://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let mut input = [0; 19];
+    let header = HeaderWriter::new(&mut input)
+        .contract(ContractRef::new(
+            aimdb_data_contracts::name_id("temperature"),
+            1,
+            V2::shape_of(1),
+        ))
+        .codec(PayloadCodec::Postcard)
+        .finish()
+        .unwrap();
+    input[header..].copy_from_slice(&21.5_f32.to_le_bytes());
+    // The concurrent broker spawns independent tasks and requires a static push.
+    let input = Box::leak(Box::new(input));
+
+    async fn database(
+        connector: impl aimdb_core::ConnectorBuilder + 'static,
+        celsius: f32,
+    ) -> (aimdb_core::AimDb, aimdb_core::builder::AimDbRunner) {
+        let key_in_9 = aimdb_core::Name::<V2>::new("in");
+        let key_out_10 = aimdb_core::Name::<V2>::new("out");
+        let mut b = AimDbBuilder::new()
+            .runtime(Arc::new(TokioAdapter))
+            .with_connector(connector);
+        b.configure(key_in_9, |r| {
+            r.buffer(BufferCfg::SingleLatest)
+                .link_from("mqtt://parity/envelope/in")
+                .with_qos(1)
+                .accepts_from::<1>()
+                .with_link_codec(Postcard::<64>)
+                .with_envelope(EnvelopeCarrier::Inline)
+                .finish();
+        });
+        b.configure(key_out_10, |r| {
+            r.buffer(BufferCfg::SingleLatest)
+                .source(move |_, tx| async move {
+                    loop {
+                        tx.produce(V2 {
+                            celsius,
+                            quality: 300,
+                        });
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .link_to("mqtt://parity/envelope/out")
+                .with_link_codec(Postcard::<64>)
+                .with_envelope(EnvelopeCarrier::Inline)
+                .sends_as::<1>()
+                .with_qos(1)
+                .finish();
+        });
+        b.build().await.unwrap()
+    }
+    let (native, native_runner) = database(
+        MqttConnector::new(url.clone()).with_client_id("envelope-native"),
+        25.0,
+    )
+    .await;
+    let (embedded, embedded_runner) = database(
+        MqttConnector::new(url)
+            .transport(TokioNet::tcp())
+            .with_client_id("envelope-embedded"),
+        26.0,
+    )
+    .await;
+    let record_key_3 = aimdb_core::Name::<V2>::new("in");
+    let mut a = native.consumer(record_key_3).unwrap().subscribe();
+    let record_key_4 = aimdb_core::Name::<V2>::new("in");
+    let mut b = embedded.consumer(record_key_4).unwrap().subscribe();
+    let broker =
+        fake_broker_concurrent(listener, seen.clone(), Some(("parity/envelope/in", input)));
+    let values = tokio::select! {
+        _ = native_runner.run() => panic!("native runner stopped"),
+        _ = embedded_runner.run() => panic!("embedded runner stopped"),
+        _ = broker => panic!("broker stopped"),
+        values = async {
+            let values = (a.recv().await.unwrap(), b.recv().await.unwrap());
+            loop {
+                let both_sent = {
+                    let seen = seen.lock().unwrap();
+                    [25.0_f32, 26.0_f32].iter().all(|value| seen.published.iter().any(|(_, bytes)| {
+                        Envelope::parse(bytes).is_ok_and(|env| env.payload() == value.to_le_bytes())
+                    }))
+                };
+                if both_sent { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            values
+        } => values,
+        _ = tokio::time::sleep(Duration::from_secs(15)) => panic!("envelope parity watchdog"),
+    };
+    for value in [values.0, values.1] {
+        assert_eq!(
+            value.value,
+            V2 {
+                celsius: 21.5,
+                quality: 1
+            }
+        );
+        assert!(value.stamp().as_nanos() > 0);
+    }
+    for db in [&native, &embedded] {
+        let routes =
+            aimdb_core::InboundDispatch::new(db, "mqtt", &aimdb_mqtt_connector::MqttGrammar)
+                .unwrap();
+        let stats = routes.stats(0).unwrap();
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(stats.upgraded[0].count, 1);
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.connects, 2);
+    let mut sent_values = Vec::new();
+    for (topic, bytes) in &seen.published {
+        assert_eq!(topic, "parity/envelope/out");
+        let env = Envelope::parse(bytes).unwrap();
+        assert_eq!(bytes.len(), 19);
+        assert_eq!(env.contract().version(), 1);
+        assert_eq!(env.contract().shape(), V2::shape_of(1));
+        sent_values.push(f32::from_le_bytes(env.payload().try_into().unwrap()));
+    }
+    sent_values.sort_by(f32::total_cmp);
+    sent_values.dedup();
+    assert_eq!(
+        sent_values,
+        [25.0, 26.0],
+        "both backends must send their own downgraded value"
+    );
+}
+
+mod rolling_upgrade;

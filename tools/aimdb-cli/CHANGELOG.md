@@ -1,0 +1,155 @@
+# Changelog - aimdb-cli
+
+All notable changes to the `aimdb-cli` tool will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- **`aimdb record list` shows a `Key` column (#455)** as its first column:
+  the record key that `aimdb record get` / `set` and `aimdb watch` take. The
+  `Name` column (the Rust type name) stays beside it. JSON output is
+  unchanged: it already carries `record_key`.
+
+- **`aimdb record list` shows a `Schema` column** with the record's declared
+  data contract (`name vN`, `-` when none), as the graph table already does.
+  JSON output is unchanged: it already carries `schema_type` /
+  `schema_version`.
+
+### Changed
+
+- **`aimdb watch <record>` starts with the record's current value as a
+  snapshot (#438),** followed by the `📸 snapshot complete` line. The value
+  arrived before too, as a plain first event; it still counts toward
+  `--count`, and `--new` still skips it.
+
+### Removed (breaking)
+
+- **`aimdb generate` (#411)** and the `aimdb-codegen` dependency. Write the
+  wiring in Rust as the AimDB usage guide shows and inspect the running
+  instance with `aimdb watch` / `aimdb record`.
+
+## [0.8.0] - 2026-11-03
+
+### Added
+
+- **`watch --new` and `--timeout` (#405).** `--new` counts only updates
+  written after the watch is armed; `--timeout` gives up with the new exit
+  code 4. With `--format json`, the watch ends with an outcome line on stderr
+  (`ok`, `timeout`, `disconnected`, `refused`, `stopped`). A connection lost
+  before `--count` updates now exits 3 instead of 0.
+
+- **Write timestamps (#326).** `aimdb watch` shows `ts` (seconds since
+  instance start) and gains `--format json`: one NDJSON object per update on
+  stdout, status on stderr. `aimdb record get` prints `ts`; its JSON formats
+  are `{value, ts}`. Requires an AimX 4.0 server.
+
+- **`instance info` shows the build an instance runs (#331)**, with
+  `--format` and `--post-link`; `instance list` gains a Name column.
+
+- **`graph nodes` shows each record's schema and outbound link addresses
+  (#332).** New "Schema" column (`temperature v2`); "Outbound" lists the
+  link addresses instead of `yes`, and falls back to `yes` for servers that
+  send only `has_outbound_link`.
+
+### Fixed
+
+- **`graph nodes`, `graph edges` and `graph dot` read origins and edge types
+  with data.** Those arrive as objects (`{"link": {...}}`,
+  `{"link_out": {...}}`), so link and transform records showed `-` or were
+  drawn as passive, and transform edges were never styled. They now show the
+  variant name. The README's `jq` example filters transforms the same way.
+
+- **The `yaml` feature builds again.** `instance list --format yaml` serialized `aimdb_client::InstanceInfo`, which does not implement `Serialize`, so `aimdb-cli` never compiled with `--features yaml`. YAML now uses the same serializable form as JSON, with the same field names (`socket_path`, …). `make test` and `make clippy` now also build the CLI with `--features yaml`.
+
+### Changed (breaking)
+
+- **Exit codes per failure class (Issue #334).** `aimdb` exited with 1 for every error; it now exits with 1 when the instance or a remote service refused the request (record not found, write-protected, server error), 2 for usage errors (clap's, an unsupported `--connect` endpoint, invalid JSON on the command line) and 3 for environment failures worth retrying (connection failed, no instance found, protocol mismatch, I/O, a reply that does not parse). Codes 4 and up are left to individual commands. Scripts that treated 1 as "unreachable" must check for 3.
+
+## [0.7.0] - 2026-09-18
+
+### Added
+
+- **`aimdb watch` reports delivery gaps.** The watcher rides the loss-aware `AimxConnection::subscribe`, printing a `⚠️ gap: N update(s) dropped` line before the event that follows a gap, plus a session total when watching stops. A silent hole in the value stream is no longer indistinguishable from an idle producer. It also prints a `📸 snapshot complete (N records)` line when the late-join burst closes — the one marker that tells a complete initial state from a truncated one — and a notice in place of any frame whose payload did not decode.
+
+- **Global `--connect <endpoint>` flag + `AIMDB_CONNECT` env (Issue #123).** Choose the target instance by `scheme://` URL — `unix://PATH`, `serial://DEVICE?baud=N` (with the `transport-serial` feature), or a bare path (the `unix://` shorthand). Precedence: `--connect` → `AIMDB_CONNECT` → UDS auto-discovery. `instance info`/`ping` now work over any endpoint (not just discovered sockets). New `transport-serial` feature (off by default; pulls libudev) adds the serial transport to the resolver.
+
+### Fixed
+
+- **`aimdb watch` no longer exits 0 on a refused subscription.** A denied subscribe (or one over the server's per-connection limit) reached the watcher as a silent end of stream, so it printed its closing summary and reported success on a session that never started. The refusal now arrives as a terminal error item: `watch` reports it and exits non-zero, skipping the summary.
+
+### Changed (breaking)
+
+- **Per-command `--socket` flags removed in favor of the global `--connect` (Issue #123).** `aimdb record/graph/watch/instance … --socket <path>` is gone; pass `--connect <endpoint>` (a bare path still works) or rely on `AIMDB_CONNECT`/auto-discovery. `instance list` remains discovery-only.
+
+### Changed
+
+- **Migrated to the engine-based `aimdb-client::AimxConnection` (Issue #39).** All commands (`watch`, `record`, `graph`) now use `AimxConnection` instead of the retired `AimxClient`, speaking the reshaped **AimX-v2** protocol. `aimdb watch` subscribes via the engine, which streams updates routed by request id — there is no server-allocated subscription id to display, and `--queue-size` is accepted for compatibility but no longer meaningful (queue sizing is now an engine concern).
+
+## [0.6.0] - 2026-03-11
+
+### Added
+
+- **Generate Command**: New `aimdb generate` subcommand for data-driven design tooling via `aimdb-codegen`
+  - Mermaid diagram generation from `.aimdb/state.toml`
+  - Rust schema source generation (`generated_schema.rs`)
+  - Common crate scaffolding
+  - Hub binary scaffolding
+- **Watch Command**: New `aimdb watch` subcommand for live record monitoring
+  - Real-time event streaming with formatted output
+- New dependency on `aimdb-codegen` for code generation capabilities
+
+## [0.5.0] - 2026-02-21
+
+### Added
+
+- **Graph Commands**: New `aimdb graph` command group for dependency graph exploration
+  - `graph nodes`: List all nodes with origin, buffer type, capacity, tap count, outbound status
+  - `graph edges`: List all directed edges showing data flow between records
+  - `graph order`: Show topological ordering of records (spawn/initialization order)
+  - `graph dot`: Export dependency graph in DOT format for Graphviz visualization
+- **Graph Output Formatting**: Table and JSON formatters for graph data
+  - Color-coded origin types (source=cyan, link=green, transform=yellow)
+  - Color-coded edge types (transform_input=blue, tap=gray)
+- **README Documentation**: Comprehensive documentation for all graph commands with examples
+
+## [0.4.0] - 2025-12-25
+
+### Changed
+
+- **Dependency Update**: Updated `aimdb-client` and `aimdb-core` dependencies to 0.4.0
+
+## [0.3.0] - 2025-12-15
+
+### Changed
+
+- **RecordMetadata Updates**: Output formatters updated to handle new `record_id` and `record_key` fields in `RecordMetadata`
+- JSON and table output now display RecordId and RecordKey alongside TypeId for complete record identification
+
+## [0.1.0] - 2025-11-06
+
+### Added
+
+- Initial release of AimDB CLI tool (skeleton implementation)
+- Instance discovery command structure
+- Record inspection command structure
+- Live watch functionality scaffolding
+- Basic command-line argument parsing
+
+### Known Limitations
+
+- Commands are not yet fully implemented
+- Placeholder implementation for future development
+
+---
+
+[Unreleased]: https://github.com/aimdb-dev/aimdb/compare/v3.0.0...HEAD
+[0.8.0]: https://github.com/aimdb-dev/aimdb/compare/v2.0.0...v3.0.0
+[0.7.0]: https://github.com/aimdb-dev/aimdb/compare/v1.1.0...v2.0.0
+[0.5.0]: https://github.com/aimdb-dev/aimdb/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/aimdb-dev/aimdb/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/aimdb-dev/aimdb/compare/v0.1.0...v0.3.0
+[0.1.0]: https://github.com/aimdb-dev/aimdb/releases/tag/v0.1.0

@@ -1,0 +1,188 @@
+[workspace]
+members = [
+    "aimdb-derive",
+    "aimdb-build-info",
+    "aimdb-cdr",
+    "aimdb-data-contracts",
+    "aimdb-core",
+    "aimdb-client",
+    "aimdb-embassy-adapter",
+    "aimdb-tokio-adapter",
+    "aimdb-sync",
+    "aimdb-persistence",
+    "aimdb-persistence-sqlite",
+    "aimdb-mqtt-connector",
+    "aimdb-zenoh-connector",
+    "aimdb-knx-connector",
+    "aimdb-websocket-connector",
+    "aimdb-uds-connector",
+    "aimdb-serial-connector",
+    "aimdb-tcp-connector",
+    "aimdb-wasm-adapter",
+    "tools/check-no-globals",
+    "tools/embedded-check-fixture",
+    "tools/rolling-upgrade-fixture/contracts_n",
+    "tools/rolling-upgrade-fixture/contracts_n1",
+    "tools/rolling-upgrade-fixture/contracts_changed",
+    "tools/aimdb-cli",
+    "tools/aimdb-mcp",
+    "examples/knx-connector-demo-common",
+    "examples/mqtt-connector-demo-common",
+    "examples/tokio-mqtt-connector-demo",
+    "examples/tokio-knx-connector-demo",
+    "examples/embassy-mqtt-connector-demo",
+    "examples/embassy-knx-connector-demo",
+    "examples/embassy-serial-connector-demo",
+    "examples/embassy-bench-stm32h5",
+    "examples/sync-api-demo",
+    "examples/remote-access-demo",
+    "examples/hello-mailbox",
+    "examples/hello-mailbox-async",
+    "examples/hello-single-latest",
+    "examples/hello-single-latest-async",
+    "examples/hello-spmc-ring",
+    "examples/hello-spmc-ring-async",
+    "examples/readme-quickstart",
+    "examples/serve-records-http-demo",
+    # Benchmarking infrastructure — host-only, excluded from default-members
+    "aimdb-bench", 
+]
+resolver = "2"
+# Note: build aimdb-core only by default. Use make all to build the full workspace!
+default-members = ["aimdb-core"]
+
+# debug = 2 embeds full DWARF location info; without it, probe-rs/defmt can't
+# resolve file:line for release-profile embedded binaries ("insufficient
+# DWARF info" at runtime). No effect on codegen or binary size — only debug
+# sections grow.
+[profile.release]
+debug = 2
+
+[workspace.package]
+version = "3.0.0"
+edition = "2021"
+# The compiler we build and test with, and so the only one we can honestly
+# promise consumers. Bump it together with rust-toolchain.toml.
+rust-version = "1.98.0"
+authors = ["AimDB Team <team@aimdb.dev>"]
+license = "Apache-2.0"
+repository = "https://github.com/aimdb-dev/aimdb"
+homepage = "https://aimdb.dev"
+description = "Async in-memory database for data synchronization across MCU → edge → cloud environments"
+keywords = ["database", "async", "embedded", "sync", "iot"]
+categories = ["database-implementations", "embedded", "asynchronous"]
+
+[workspace.dependencies]
+# Core async runtime
+tokio = { version = "1.49", default-features = false, features = ["macros", "rt-multi-thread"] }
+
+# Serialization (no_std compatible by default)
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+
+# Error handling
+thiserror = "2.0.16"
+anyhow = "1.0"
+
+# Serialization - extend with error handling
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+
+# COBS framing for the serial connector (no_std; self-synchronizing 0x00-delimited
+# frames over a lossy/unframed byte medium).
+cobs = { version = "0.5.1", default-features = false }
+
+# Serial/UART transport for the tokio half of the serial connector (std only).
+tokio-serial = "5.4.5"
+
+# Basic observability
+tracing = { version = "0.1", default-features = false }
+# Second facade destination (design 050), for FFI hosts that cannot be handed a
+# global `tracing` subscriber. no_std by default.
+log = { version = "0.4", default-features = false }
+
+# Async utilities
+futures = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
+# CLI (for aimdb-cli)
+clap = { version = "4.0", features = ["derive"] }
+
+# Development dependencies
+tokio-test = "0.4"
+aimdb-tokio-adapter = { path = "./aimdb-tokio-adapter" }
+
+# Embassy ecosystem for embedded async
+embassy-stm32 = { version = "0.6.0", features = [
+    "defmt",
+    "stm32h563zi",
+    "memory-x",
+    "time-driver-any",
+    "exti",
+    "unstable-pac",
+    "low-power",
+] }
+embassy-sync = { version = "0.8.0", features = [
+    "defmt",
+] }
+embassy-executor = { version = "0.10.0", features = [
+    "platform-cortex-m",
+    "executor-thread",
+    "defmt",
+] }
+embassy-time = { version = "0.5.1", features = [
+    "defmt",
+    "defmt-timestamp-uptime",
+    "tick-hz-32_768",
+] }
+embassy-net = { version = "0.9.0", features = [
+    "defmt",
+    "tcp",
+    "dhcpv4",
+    "medium-ethernet",
+    "proto-ipv6",
+] }
+embassy-usb = { version = "0.6.0", features = ["defmt"] }
+embassy-futures = { version = "0.1.2" }
+
+# Embedded HAL for peripheral abstractions
+embedded-hal = "1.0.0"
+embedded-hal-1 = { package = "embedded-hal", version = "1.0" }
+embedded-hal-async = "1.0"
+embedded-hal-nb = "1.0"
+embedded-hal-bus = { version = "0.2", features = ["async"] }
+embedded-io = { version = "0.7.1" }
+embedded-io-async = { version = "0.7.0" }
+embedded-nal-async = "0.8.0"
+embedded-storage = "0.3.1"
+
+# Embedded runtime and utilities
+cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7.0"
+critical-section = "1.1"
+static_cell = "2"
+
+# Embedded debugging and logging
+defmt = "1.0.1"
+defmt-rtt = "1.0.0"
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+
+# Embedded utilities
+heapless = { version = "0.9.4", default-features = false }
+micromath = "2.0.0"
+stm32-fmc = "0.4.0"
+
+# The adapter needs `poll_next_message` / `poll_changed` — merged upstream, not
+# in embassy-sync 0.8.0. Patches aren't published, so this blocks publishing
+# `aimdb-embassy-adapter` (008 §6); drop it once a release carries those APIs.
+# Pinned to an upstream commit and fetched by cargo, so a plain `git clone`
+# builds without submodules (#341).
+[patch.crates-io]
+embassy-sync = { git = "https://github.com/embassy-rs/embassy", rev = "03c826f2544220cb44b2dec05f5d636a80d39382" }
+# Published embassy-net-driver-channel 0.4.0 calls the pre-guard
+# `zerocopy_channel` API the patch above no longer has, and its driver trait
+# must be the same instance embassy-net sees — so both follow embassy-sync.
+embassy-net-driver-channel = { git = "https://github.com/embassy-rs/embassy", rev = "03c826f2544220cb44b2dec05f5d636a80d39382" }
+embassy-net-driver = { git = "https://github.com/embassy-rs/embassy", rev = "03c826f2544220cb44b2dec05f5d636a80d39382" }
+
+[workspace.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

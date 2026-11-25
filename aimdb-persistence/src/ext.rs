@@ -1,0 +1,99 @@
+//! Record registration extension: `.persist()` on [`RecordRegistrar`].
+
+use crate::events::{report, PersistenceEvent};
+
+use std::sync::Arc;
+
+use aimdb_core::typed_api::RecordRegistrar;
+
+use crate::backend::PersistenceBackend;
+use crate::builder_ext::PersistenceState;
+
+/// Extension trait that adds `.persist()` to [`RecordRegistrar`].
+///
+/// `T: Serialize` is required so values can be converted to JSON for storage.
+/// `.with_remote_access()` is **not** required — persistence subscribes to the
+/// typed buffer directly.
+pub trait RecordRegistrarPersistExt<'a, T>
+where
+    T: serde::Serialize + Send + Sync + Clone + core::fmt::Debug + 'static,
+{
+    /// Opt this record into persistence.
+    ///
+    /// Spawns a background subscriber (via `.tap()`) that serializes each
+    /// value to JSON and writes it to the configured backend. Retention is
+    /// managed by the cleanup task registered during `with_persistence()`.
+    ///
+    /// Rows are stored under the record key. That key is also the `topic` a
+    /// history query returns, so history is authorized against the same name
+    /// as live reads.
+    fn persist(&mut self) -> &mut Self;
+}
+
+impl<'a, T, S: aimdb_core::SchemaState> RecordRegistrarPersistExt<'a, T>
+    for RecordRegistrar<'a, T, S>
+where
+    T: serde::Serialize + Send + Sync + Clone + core::fmt::Debug + 'static,
+{
+    fn persist(&mut self) -> &mut Self {
+        let record_name = self.record_key().to_owned();
+        // Retrieve the backend from the builder's Extensions TypeMap, if configured.
+        let backend: Option<Arc<dyn PersistenceBackend>> = self
+            .extensions()
+            .get::<PersistenceState>()
+            .map(|s| s.backend.clone());
+
+        // If no backend is configured, treat `.persist()` as a no-op so that
+        // persistence remains optional and does not cause runtime panics.
+        let Some(backend) = backend else {
+            report(PersistenceEvent::BackendMissing {
+                record: &record_name,
+            });
+            return self;
+        };
+        // Subscribe to the typed buffer as a tap (side-effect observer).
+        // The runtime context isn't needed — persistence is runtime-agnostic.
+        self.tap(move |_ctx, consumer| async move {
+            let mut reader = consumer.subscribe();
+
+            loop {
+                // The backend stores its own persist time, not the write stamp
+                // (design 058 §5.1).
+                let value = match reader.recv().await {
+                    Ok(sample) => sample.value,
+                    Err(aimdb_core::DbError::BufferLagged { .. }) => continue,
+                    Err(_) => break,
+                };
+
+                // T is known here — serialize directly, no with_remote_access() needed.
+                let json = match serde_json::to_value(&value) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        report(PersistenceEvent::SerializeFailed {
+                            record: &record_name,
+                            error: &e,
+                        });
+                        continue;
+                    }
+                };
+
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+
+                if let Err(e) = backend.store(&record_name, &json, timestamp).await {
+                    report(PersistenceEvent::StoreFailed {
+                        record: &record_name,
+                        error: &e,
+                    });
+                }
+            }
+
+            aimdb_core::log_debug!(
+                "Persistence subscriber for '{}' stopping (buffer closed)",
+                record_name
+            );
+        })
+    }
+}

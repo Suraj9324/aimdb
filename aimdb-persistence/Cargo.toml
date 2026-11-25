@@ -1,0 +1,31 @@
+[package]
+name = "aimdb-persistence"
+version = "0.3.0"
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Persistence backend trait and extension traits for AimDB"
+keywords = ["database", "persistence", "async"]
+categories = ["database-implementations"]
+
+[features]
+default = ["std"]
+std = ["aimdb-core/std", "serde_json/std"]
+tracing = ["aimdb-core/tracing"]
+log = ["aimdb-core/log"]
+
+[dependencies]
+aimdb-core = { version = "3.0.0", path = "../aimdb-core", default-features = false, features = [
+    "std",
+] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+aimdb-tokio-adapter = { path = "../aimdb-tokio-adapter" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("defmt"))'] }

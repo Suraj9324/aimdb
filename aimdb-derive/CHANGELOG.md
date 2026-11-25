@@ -1,0 +1,73 @@
+# Changelog - aimdb-derive
+
+All notable changes to the `aimdb-derive` crate will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Breaking — typed record keys (design 063)
+
+- RecordKey requires record_key(contract = T) or record_key(payload = T); prefix moves into record_key and key_prefix is removed.
+
+### Fixed
+
+- **`migration_chain!` requires one contract name across the chain.** Every
+  historical type's `SchemaType::NAME` must equal the current type's, checked
+  at compile time. A differently named older type used to compile and then
+  have its frames rejected as `contract_mismatch`.
+
+## [0.3.0] - 2026-11-03
+
+### Added
+
+- **`#[derive(RosMessage)]`** for a struct mirroring a ROS 2 message: emits
+  `SchemaType` (`NAME` = the ROS type), a CDR `Linkable` through `aimdb-cdr`
+  with a bounded `encode_into`, and `RosMessage`.
+  `#[ros(type = "pkg/msg/Name", hash = "RIHS01_…")]` is required and checked
+  at compile time; `#[ros(encode_capacity = N)]` sizes the scratch (default
+  256); `#[ros(max_len = N)]` bounds a `String` or `Vec` field, refused on
+  encode past it. Generic types, enums, and tuple or unit structs are refused.
+
+### Changed
+
+- **`#[derive(Linkable)]` sets `WIRE_FORMAT = Json`.**
+
+## [0.2.0] - 2026-09-18
+
+### Added
+
+- **`#[derive(Linkable)]` proc-macro** (design 041 §3.3). Emits a JSON `aimdb_data_contracts::Linkable` impl (`serde_json::to_vec`/`from_slice` via the `__private` re-export, same foreign-crate-path pattern as `migration_chain!`) — replaces the hand-written `from_bytes`/`to_bytes` boilerplate every JSON-wire type repeated. `no_std + alloc` compatible; binary wire formats (e.g. KNX DPT codecs) still implement `Linkable` by hand.
+- **`migration_chain!` proc-macro.** Variable-arity replacement for the 3-arm `macro_rules!` previously hand-unrolled in `aimdb-data-contracts`; re-exported as `aimdb_data_contracts::migration_chain!` with the same grammar and call path. Generated dispatch is `O(N)` in code size regardless of chain length (one `__up_k`/`__down_k` helper per step). Emits foreign-crate paths into `aimdb_data_contracts` without depending on it (same pattern as `RecordKey` → `aimdb_core`) — a build-time-only dependency with no target/runtime/`no_std` impact.
+- **Tree-free version probe in `migrate_from_bytes`.** The generated dispatch no longer parses the payload into a full `serde_json::Value` tree to read the version field. It now scans a small `#[derive(serde::Deserialize)]` probe struct for just the version, then parses the same bytes a second time directly into the matched concrete type — peak allocation drops from O(payload tree) to O(concrete struct). `serde_json::Error::is_data()` preserves the existing `MissingVersion` vs `DeserializationFailed` split (missing/wrong-type field vs malformed JSON). Wire behavior is unchanged (same errors for missing/unknown versions).
+
+### Fixed
+
+- **`migrate_from_bytes` reports `VersionTooOld` for below-minimum source versions.** A payload whose version is below `MIN_VERSION` (e.g. `0`) previously fell through to `VersionTooNew` (`"source version 0 is newer than current N"`, contradictory); the generated dispatch now returns `VersionTooOld { target, minimum }`, matching the `migrate_to_version` path. Covered by a new `error_on_source_version_too_old` round-trip test.
+
+## [0.1.0] - 2025-12-23
+
+### Added
+
+- **Initial Release**: `#[derive(RecordKey)]` macro for compile-time checked record keys
+- **Attributes**:
+  - `#[key = "..."]` (required): String representation for each variant
+  - `#[key_prefix = "..."]` (optional): Namespace prefix applied to all variants
+  - `#[link_address = "..."]` (optional): Connector metadata (MQTT topics, KNX addresses)
+- **Generated Implementations**:
+  - `impl RecordKey` with `as_str()` and `link_address()` methods
+  - `impl Borrow<str>` for O(1) HashMap lookups
+  - `impl Hash` that hashes the string key (satisfies `Borrow<str>` contract)
+- **Compile-Time Validation**:
+  - Duplicate key detection
+  - Unit variant enforcement (no tuple/struct variants)
+  - Missing `#[key]` attribute detection
+- **no_std Support**: Fully compatible with `no_std` environments
+
+---
+
+[Unreleased]: https://github.com/aimdb-dev/aimdb/compare/v3.0.0...HEAD
+[0.3.0]: https://github.com/aimdb-dev/aimdb/compare/v2.0.0...v3.0.0
+[0.2.0]: https://github.com/aimdb-dev/aimdb/compare/v1.1.0...v2.0.0
+[0.1.0]: https://github.com/aimdb-dev/aimdb/releases/tag/v0.1.0
